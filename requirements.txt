@@ -1,0 +1,7 @@
+earthengine-api
+functions-framework
+geopandas
+google-cloud-storage
+pandas
+python-dotenv
+requests

@@ -7,7 +7,7 @@ venv/
 env/
 
 # Ignore data folder
-data/
+exported_data/
 
 # Ignore Python bytecode cache
 __pycache__/

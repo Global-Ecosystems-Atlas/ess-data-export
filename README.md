@@ -5,8 +5,9 @@ This script exports annotations from a Earth System Studio (ESS) project and upl
 ## Prerequisites
 
 - Python **3.13+**
+- Git
 - Access to the **Earth System Studio API**
-- Access to the **Google Cloud project** with Google Cloud Storage (GCS) and Google Earth Engine (GEE)
+- (optionnal) Access to the **Google Cloud project** with Google Cloud Storage (GCS) and Google Earth Engine (GEE)
 
 ## Installation & Setup
 

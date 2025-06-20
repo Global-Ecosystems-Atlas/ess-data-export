@@ -1,6 +1,6 @@
 import ee
-import functions_framework
 import geopandas as gpd
+import json
 import logging
 import os
 import pandas as pd
@@ -10,171 +10,251 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from datetime import datetime
 from dotenv import load_dotenv
 from google.cloud import storage
-
-
-# This script exports annotations from an Earth System Studio (ESS) project to a Google Earth Engine (GEE) assets folder via Google Cloud Storage (GCS).
-# The script performs the following steps:
-# 1. Calls the ESS API and retrieves all annotations from the ESS project defined by the ESS_PROJECT_ID environment variable, then formats them into a GeoDataFrame.
-# 2. Creates a shapefile from the GeoDataFrame and compresses it into a ZIP file.
-# 3. Uploads the ZIP file to the Google Cloud Storage bucket specified by the BUCKET_NAME and BLOB_NAME environment variables.
-# 4. Uploads the ZIP file from the bucket to the Earth Engine asset defined by the GEE_ASSET_ID environment variable.
-# 
-# Environment variables are defined either:
-# - In a `.env` file for the development environment (local), or
-# - In the "Edit & deploy new revision / Container(s) / Variables & Secrets" section for the production environment (Cloud Run).
+from pprint import pprint
+from shapely.geometry import Point
+from typing import Tuple
+#TODO: clean imports
 
 
 # Configure logging
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(level=logging.INFO)
 
-# Definition of global variables
-load_dotenv()
-gee_asset_id = os.getenv('GEE_ASSET_ID') # Google Earth Engine asset ID
-blob_name = os.getenv('BLOB_NAME') # Google Cloud Storage blob name
-bucket_name = os.getenv('BUCKET_NAME') # Google Cloud Storage bucket name
-env = os.getenv('ENV', 'prod').lower() # Environment: development (dev) or production (prod), default to 'prod'
-ess_project_id = os.getenv('ESS_PROJECT_ID') # Earth System Studio project ID
-gc_project_id = os.getenv('GOOGLE_CLOUD_PROJECT', 'geo-global-ecosystems-atlas') # Google Cloud project ID, default to 'geo-global-ecosystems-atlas'
-api_key = os.getenv('API_KEY') # Earth System Studio API key
 
-# Check for missing required variables
-required_vars = {
-    'GEE_ASSET_ID': gee_asset_id,
-    'BLOB_NAME': blob_name,
-    'BUCKET_NAME': bucket_name,
-    'ESS_PROJECT_ID': ess_project_id,
-    'API_KEY': api_key
-}
+class Config:
+    def __init__(self):
+        load_dotenv()
+        self.api_key = os.getenv("API_KEY") # Earth System Studio API key
+        self.blob_name = os.getenv("BLOB_NAME") # Google Cloud Storage blob name
+        self.bucket_name = os.getenv("BUCKET_NAME") # Google Cloud Storage bucket name
+        self.env = os.getenv("ENV", "prod").lower() # Environment: development (dev) or production (prod), default to 'prod'
+        self.ess_project_id = os.getenv("ESS_PROJECT_ID") # Earth System Studio project ID
+        self.gc_project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "geo-global-ecosystems-atlas") # Google Cloud project ID, default to 'geo-global-ecosystems-atlas'. Accessible if the code is running on Google Cloud Run.
+        self.gee_asset_id = os.getenv("GEE_ASSET_ID") # Google Earth Engine asset ID
+        self.validate()
 
-missing = [name for name, value in required_vars.items() if not value]
+    def validate(self):
+        missing = [name for name, value in vars(self).items() if value in (None, "")]
+        if missing:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing)}.")
 
-if missing:
-    logging.error(f'Missing required environment variables: {", ".join(missing)}')
-    sys.exit(1)
+        if self.env not in ("dev", "prod"):
+            raise ValueError("The environment variable ENV must be set to 'dev' or 'prod'.")
 
 
-def get_gdf_annotations():
+class ESS_API:
+    def __init__(self, config: Config) -> None:
+        self.base_url: str = "https://earth-system-studio.allen.ai"
+        self.api_key: str = config.api_key
+        self.headers: dict[str, str] = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json"
+        }
 
-    logging.info('Starting request to the Earth System Studio API')
+    def test_connection(self) -> None:
+        """Check if the API is reachable (note: this does not verify if the API key is valid)."""
+        try:
+            r = requests.get(f"{self.base_url}/", headers=self.headers, timeout=5)
+            r.raise_for_status()
+            logging.info("API connection successful.")
+        except requests.RequestException as e:
+            logging.error(f"API connection failed: {e}")
+            sys.exit(1)
 
-    r = requests.get(f'https://earth-system-studio.allen.ai/api/v1/projects/{ess_project_id}/annotations', headers={'Authorization': api_key})
-    r.raise_for_status()
+    def get_annotations(self, ess_project_id: str):
+        """Fetch all annotations for a specific ESS project identified by its ID."""
+        url = f"{self.base_url}/api/v1/projects/{ess_project_id}/annotations"
+        r = requests.get(url, headers=self.headers)
+        r.raise_for_status()
+        return r.json()
+    
+    def get_users(self, ess_project_id: str):
+        """Fetch all users for a specific ESS project identified by its ID."""
+        url = f"{self.base_url}/api/v1/projects/{ess_project_id}/users"
+        r = requests.get(url, headers=self.headers)
+        r.raise_for_status()
+        return r.json()
 
-    gdfs = []
-    geojson_data = r.json()
 
-    if 'features' in geojson_data and geojson_data['features']:
-        
-        # Flatten the metadata fields
-        for feature in geojson_data['features']:
-            metadatas = feature['properties'].pop('metadata_values', [])
-            for metadata in metadatas:
-                feature['properties'][metadata['name']] = metadata['value']
+def reset_data_folder() -> None:
+    """Delete the 'data' folder and all its contents, then recreate it as an empty directory."""
+    if os.path.exists("exported_data"):
+        shutil.rmtree("exported_data")
+    os.makedirs("exported_data")
 
-        gdf = gpd.GeoDataFrame.from_features(geojson_data['features'])
-        gdfs.append(gdf)
 
-    gdf = pd.concat(gdfs, ignore_index=True)
+def get_annotations_filename(config: Config) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return f"annotations_{timestamp}_{config.ess_project_id}"
 
-    gdf.set_crs('EPSG:4326', inplace=True)
 
-    expected_cols = ['id', gdf.geometry.name, 'start_time', 'end_time', 'tag_name', 'tag_color', 'iucn_efg_code_10m', 'iucn_efg_code_100m', 'homogeneity_estimate_10m', 'homogeneity_estimate_100m', 'interpreter_confidence (1-5)']
-    existing_cols = [col for col in expected_cols if col in gdf.columns]
-    missing_cols = [col for col in expected_cols if col not in gdf.columns]
+def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.GeoDataFrame]:
 
-    if missing_cols:
-        logging.warning(f'Missing columns: {missing_cols}')
-
-    # Safely select only the existing columns
-    gdf = gdf[existing_cols].copy()
-
-    rename_dict = {
-        'tag_name': 'efg_name',
-        'tag_color': 'efg_colour',
-        'iucn_efg_code_10m': 'code_10m',
-        'iucn_efg_code_100m': 'code_100m',
-        'homogeneity_estimate_10m': 'homog_10m',
-        'homogeneity_estimate_100m': 'homog_100m',
-        'interpreter_confidence (1-5)': 'confidence'
+    annotation_fields  = {
+        "date": "date",
+        "sample_id": "sample_id",
+        "reference_grid_id": "grid_id",
+        "latitude": "latitude",
+        "longitude": "longitude",
+        "method": "method",
+        "interpretation_scale_min": "int_min",
+        "interpretation_scale_max": "int_max",
+        "iucn_realm": "iucn_realm",
+        "iucn_biome": "iucn_biome",
+        "iucn_ecosystem_functional_group": "iucn_efg",
+        "iucn_efg_code_dominant_10m": "efg_10m",
+        "iucn_efg_code_secondary_10m": "efg2_10m",
+        "iucn_efg_code_dominant_100m": "efg_100m",
+        "iucn_efg_code_secondary_100m": "efg2_100m",
+        "source": "source",
+        "data_producer": "producer",
+        "interpreter_name": "int_name",
+        "interpreter_confidence_level": "int_conf",
+        "reviewer_name": "rev_name",
+        "reviewer_confidence_level": "rev_conf",
+        "sample_type": "samp_type",
+        "valid_year_start": "year_start",
+        "valid_year_end": "year_end",
+        "homogeneity_estimate_dominant_10m": "hom_10m",
+        "homogeneity_estimate_secondary_10m": "hom2_10m",
+        "homogeneity_estimate_dominant_100m": "hom_100m",
+        "homogeneity_estimate_secondary_100m": "hom2_100m",
+        "interpreter_comment": "int_com",
+        "reviewer_comment": "rev_com",
+        "ess_task_id": "task_id",
+        "ess_annotation_id": "annot_id"
     }
 
-    # Filter the dictionary to keep only keys that exist in df.columns
-    filtered_rename_dict = {k: v for k, v in rename_dict.items() if k in gdf.columns}
+    # Field matchers for metadata_values (keys are column names in final dataframe)
+    metadata_mapping = {
+        "iucn_efg_code_secondary_10m": ["iucn_efg_code_secondary_10m"],
+        "iucn_efg_code_dominant_100m": ["iucn_efg_code_dominant_100m", "iucn_efg_code_100m"],
+        "iucn_efg_code_secondary_100m": ["iucn_efg_code_secondary_100m"],
+        "interpreter_confidence_level": ["interpreter_confidence_level", "interpreter_confidence (1-5)"],
+        "reviewer_confidence_level": ["reviewer_confidence_level", "reviewer_confidence (1-5)"],
+        "homogeneity_estimate_dominant_10m": ["homogeneity_estimate_dominant_10m", "homogeneity_estimate_10m"],
+        "homogeneity_estimate_secondary_10m": ["homogeneity_estimate_secondary_10m"],
+        "homogeneity_estimate_dominant_100m": ["homogeneity_estimate_dominant_100m"],
+        "homogeneity_estimate_secondary_100m": ["homogeneity_estimate_secondary_100m"],
+        "interpreter_comment": ["interpreter_comment"],
+        "reviewer_comment": ["reviewer_comment"],
+    }
 
-    gdf.rename(columns=filtered_rename_dict, inplace=True)
+    # Direct mapping (from GeoJSON properties or structure)
+    direct_mapping = {
+        "latitude": lambda f: f["geometry"]["coordinates"][1],
+        "longitude": lambda f: f["geometry"]["coordinates"][0],
+        "iucn_efg_code_dominant_10m": lambda f: f["properties"].get("tag_name"),
+        "interpreter_name": lambda f: f["properties"].get("annotator_id"),
+        "valid_year_start": lambda f: f["properties"].get("start_time"),
+        "valid_year_end": lambda f: f["properties"].get("end_time"),
+        "ess_task_id": lambda f: f["properties"].get("task_id"),
+        "ess_annotation_id": lambda f: f["properties"].get("id"),
+        "reviewer_name": lambda f: f["properties"].get("reviewer_id"),
+    }
 
-    logging.info(f'End of API requests, {len(gdf)} annotations downloaded successfully')
+    # Combine both mappings
+    def extract_value(feature, column: str):
+        if column in direct_mapping:
+            return direct_mapping[column](feature)
+        if column in metadata_mapping:
+            meta = feature["properties"].get("metadata_values", [])
+            for candidate in metadata_mapping[column]:
+                for item in meta:
+                    if item["name"] == candidate:
+                        return item.get("value")
+        return None
 
-    return gdf[gdf.geometry.type == 'Point'].copy()
+    # Build rows for DataFrame
+    rows = []
+    for feature in geojson["features"]:
+        if feature["geometry"]["type"] != "Point":
+            continue
+        row = {col: extract_value(feature, col) for col in annotation_fields}
+        rows.append(row)
+
+    #TODO: post process the dict (or df)
+
+    df = pd.DataFrame(rows)
+
+    gdf_shp = df.rename(columns=annotation_fields)
+    geometry = gpd.points_from_xy(gdf_shp["longitude"], gdf_shp["latitude"])
+    gdf_shp = gpd.GeoDataFrame(gdf_shp.drop(columns=["latitude", "longitude"]), geometry=geometry)
+    gdf_shp.set_crs('EPSG:4326', inplace=True)
+    
+    return df, gdf_shp
 
 
-def upload_to_bucket(source_file_name, destination_blob_name):
+def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob_name):
     """Uploads a file to the specified Cloud Storage bucket."""
 
     client = storage.Client()
-    bucket = client.bucket(bucket_name)
+    bucket = client.bucket(destination_bucket_name)
     blob = bucket.blob(destination_blob_name)
 
     if blob.exists():
-        logging.info(f'The blob {bucket_name}/{destination_blob_name} already existed and has been overwritten.')
+        logging.info(f'The blob {destination_bucket_name}/{destination_blob_name} already existed and has been overwritten.')
     
     blob.upload_from_filename(source_file_name)
 
-    logging.info(f'Uploaded {source_file_name} to gs://{bucket_name}/{destination_blob_name}.')
+    logging.info(f'Uploaded {source_file_name} to gs://{destination_bucket_name}/{destination_blob_name}.')
 
 
-@functions_framework.http
-def main(request):
+def main(config: Config):
 
-    # Initialisation of the Google Cloud project
-    ee.Initialize(project=gc_project_id)
+    api = ESS_API(config)
+    api.test_connection()
 
-    # Retrieving and formatting annotations into a GeoDataFrame
-    point_gdf = get_gdf_annotations()
+    reset_data_folder()
+    annotations_filename = get_annotations_filename(config)
 
-    # Create a temporary directory
-    with tempfile.TemporaryDirectory() as temp_dir:
-        
-        # Temporary file name used for transfer to Google Cloud Storage
-        tmp_file = 'ess_points'
+    annotations_json = api.get_annotations(config.ess_project_id)
 
-        # Convert the GeoDataFrame to a shapefile
-        point_gdf.to_file(os.path.join(temp_dir, f'{tmp_file}.shp')) 
+    gdf, gdf_shp = restructure_annotations(annotations_json, config)
 
-        # Bundle all shapefile components into a zip file
-        with zipfile.ZipFile(os.path.join(temp_dir, f'{tmp_file}.zip'), 'w') as zipf:
-            for ext in ['.cpg', '.dbf', '.prj', '.shp', '.shx']: # List of shapefile extensions to include
-                filepath = os.path.join(temp_dir, f'{tmp_file}{ext}')
-                if os.path.exists(filepath):
-                    zipf.write(filepath, arcname=f'{tmp_file}{ext}')
-                else:
-                    logging.warning(f'{filepath} not found, skipping.')
 
-        # Upload the zipped shapefile to the Google Cloud Storage bucket
-        upload_to_bucket(os.path.join(temp_dir, f'{tmp_file}.zip'), f'{blob_name}.zip')
+    filepath = os.path.join("exported_data", f"raw_{annotations_filename}.geojson")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(annotations_json, f, indent=2)
+    gdf.to_csv(os.path.join("exported_data", f"{annotations_filename}.csv"), index=False)
+    gdf_shp.to_file(os.path.join("exported_data", f"{annotations_filename}.shp"))
 
-        # Saves the GeoDataFrame as a CSV and the zipped shapefile in the local dev environment
-        if env == 'dev':
-            os.makedirs('data', exist_ok=True) # Create the folder if it doesn't exist
-            shutil.copy(os.path.join(temp_dir, f'{tmp_file}.zip'), os.path.join('data', f'{tmp_file}.zip'))
-            point_gdf.to_csv(os.path.join('data', f'{tmp_file}.csv'), index=False)
+    # Bundle all shapefile components into a zip file
+    with zipfile.ZipFile(os.path.join("exported_data", f"{annotations_filename}.zip"), "w") as zipf:
+        for ext in [".cpg", ".dbf", ".prj", ".shp", ".shx"]: # List of shapefile extensions to include
+            filepath = os.path.join("exported_data", f"{annotations_filename}{ext}")
+            if os.path.exists(filepath):
+                zipf.write(filepath, arcname=f"{annotations_filename}{ext}")
+                os.remove(filepath)
+            else:
+                logging.warning(f"{filepath} not found, skipping.")
 
-    # The temporary directory and all files inside it are automatically deleted here
+    # TODO: from here, clean this into functions and make it optionnal as an option in the command line
+    
+    
+    # upload to GC
+    upload_to_bucket(os.path.join("exported_data", f'{annotations_filename}.zip'), config.bucket_name, f'{config.blob_name}.zip')
+
+
+    # upload to EE
+
+    ee.Authenticate()
+    ee.Initialize(project=config.gc_project_id)
 
     # Delete the old Earth Engine asset if it exists
     try:
-        info = ee.data.getInfo(gee_asset_id)
+        info = ee.data.getInfo(config.gee_asset_id)
         if info:
-            ee.data.deleteAsset(gee_asset_id)
-            logging.info(f'The asset {gee_asset_id} already existed and has been overwritten.')
+            ee.data.deleteAsset(config.gee_asset_id)
+            logging.info(f'The asset {config.gee_asset_id} already existed and has been overwritten.')
     except Exception as e:
         logging.error(f'Error checking asset: {e}')
 
     # Build the Earth Engine CLI command to upload the zipped shapefile from the bucket to the Earth Engine assets folder
-    cmd = ['earthengine', 'upload', 'table', f'--asset_id={gee_asset_id}', f'gs://{bucket_name}/{blob_name}.zip']
+    cmd = ['earthengine', 'upload', 'table', f'--asset_id={config.gee_asset_id}', f'gs://{config.bucket_name}/{config.blob_name}.zip']
 
     # Run the command
     try:
@@ -183,10 +263,10 @@ def main(request):
     except subprocess.CalledProcessError as e:
         logging.error(f'Error uploading to Earth Engine assets folder: {e.stderr.strip()}')
  
-    # The zipped shapefile in the bucket cannot be deleted automatically here because the transfer from the bucket to the Earth Engine assets folder takes some time (at least 30 seconds)
-
     return 'Script executed successfully. Please check the Tasks section in the Google Earth Engine Code Editor for more details.', 200
 
 
 if __name__ == "__main__":
-    main()
+    config = Config()
+    main(config)
+

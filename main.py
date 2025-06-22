@@ -205,17 +205,17 @@ def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob
 
 def main(config: Config):
 
+    # 1. setup and test connection to the API
     api = ESS_API(config)
     api.test_connection()
 
-    reset_data_folder()
-    annotations_filename = get_annotations_filename(config)
-
+    # 2. fetch and format data
     annotations_json = api.get_annotations(config.ess_project_id)
-
     gdf, gdf_shp = restructure_annotations(annotations_json, config)
 
-
+    # 3. save data in local in csv and shapefile (zipped) formats. save also the raw geojson
+    reset_data_folder()
+    annotations_filename = get_annotations_filename(config)
     filepath = os.path.join("exported_data", f"raw_{annotations_filename}.geojson")
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(annotations_json, f, indent=2)
@@ -232,6 +232,7 @@ def main(config: Config):
             else:
                 logging.warning(f"{filepath} not found, skipping.")
 
+    # 4. (optionnal) save data on google cloud and google earth engine assets
     # TODO: from here, clean this into functions and make it optionnal as an option in the command line
     
     

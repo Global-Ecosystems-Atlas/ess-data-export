@@ -18,12 +18,12 @@ from typing import Tuple
 
 
 """
-This script exports annotations from an Earth System Studio (ESS) project to the local 'exported_data' folder.
+This script exports annotations from an Earth System Studio (ESS) project into a local folder named 'exported_data'.
 If run with the '--online-export' flag, the annotations are also uploaded to Google Cloud Storage (GCS) and Google Earth Engine (GEE).
 
 The script performs the following steps:
 1. Verifies all prerequisites, including required environment variables and API connectivity.
-2. Retrieves annotations from the ESS project defined by the 'ESS_PROJECT_ID' environment variable.
+2. Retrieves and formats annotations from the ESS project defined by the 'ESS_PROJECT_ID' environment variable.
 3. Exports the annotations to the 'exported_data' folder in CSV, zipped Shapefile, and GeoJSON formats.
 
 Optional (enabled with '--online-export'):

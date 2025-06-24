@@ -125,6 +125,7 @@ def get_annotations_filename(config: Config) -> str:
 
 def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.GeoDataFrame]:
 
+    # List of the 32 fields associated with each annotation as defined in the document 'Global Ecosystems Atlas Training Dataset: Design and Specification'.
     annotation_fields  = {
         "date": "date",
         "sample_id": "sample_id",

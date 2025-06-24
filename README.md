@@ -65,7 +65,7 @@ Run the script with the following command.
    py main.py [--online-export]
    ```
 
-After execution, check the `exported_data` folder in the project directory for the exported files (CSV, GeoJSON, and zipped Shapefile), and if the `--online-export` flag was used, verify that the data has also been uploaded to your GEE assets at code.earthengine.google.com.
+After execution, check the `exported_data` folder in the project directory for the exported files (CSV, GeoJSON, and zipped Shapefile), and if the `--online-export` flag was used, verify that the data has also been uploaded to your GEE assets at https://code.earthengine.google.com.
 
 ## Security Notes
 

@@ -64,14 +64,14 @@ class ESS_API:
             logging.error(f"API connection failed: {e}")
             sys.exit(1)
 
-    def get_annotations(self, ess_project_id: str):
+    def request_annotations(self, ess_project_id: str):
         """Fetch all annotations for a specific ESS project identified by its ID."""
         url = f"{self.base_url}/api/v1/projects/{ess_project_id}/annotations"
         r = requests.get(url, headers=self.headers)
         r.raise_for_status()
         return r.json()
     
-    def get_users(self, ess_project_id: str):
+    def request_users(self, ess_project_id: str):
         """Fetch all users for a specific ESS project identified by its ID."""
         url = f"{self.base_url}/api/v1/projects/{ess_project_id}/users"
         r = requests.get(url, headers=self.headers)
@@ -130,14 +130,15 @@ def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.
 
     # Field matchers for metadata_values (keys are column names in final dataframe)
     metadata_mapping = {
+        #"iucn_efg_code_dominant_10m": ["iucn_efg_code_dominant_10m", "iucn_efg_code_10m"],
         "iucn_efg_code_secondary_10m": ["iucn_efg_code_secondary_10m"],
-        "iucn_efg_code_dominant_100m": ["iucn_efg_code_dominant_100m", "iucn_efg_code_100m"],
+        "iucn_efg_code_dominant_100m": ["iucn_efg_code_dominant_100m", "iucn_efg_code_100m", "Iucn_efg_code_100m"],
         "iucn_efg_code_secondary_100m": ["iucn_efg_code_secondary_100m"],
         "interpreter_confidence_level": ["interpreter_confidence_level", "interpreter_confidence (1-5)"],
         "reviewer_confidence_level": ["reviewer_confidence_level", "reviewer_confidence (1-5)"],
         "homogeneity_estimate_dominant_10m": ["homogeneity_estimate_dominant_10m", "homogeneity_estimate_10m"],
         "homogeneity_estimate_secondary_10m": ["homogeneity_estimate_secondary_10m"],
-        "homogeneity_estimate_dominant_100m": ["homogeneity_estimate_dominant_100m"],
+        "homogeneity_estimate_dominant_100m": ["homogeneity_estimate_dominant_100m", "homogeneity_estimate_100m"],
         "homogeneity_estimate_secondary_100m": ["homogeneity_estimate_secondary_100m"],
         "interpreter_comment": ["interpreter_comment"],
         "reviewer_comment": ["reviewer_comment"],
@@ -147,7 +148,7 @@ def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.
     direct_mapping = {
         "latitude": lambda f: f["geometry"]["coordinates"][1],
         "longitude": lambda f: f["geometry"]["coordinates"][0],
-        "iucn_efg_code_dominant_10m": lambda f: f["properties"].get("tag_name"),
+        "iucn_efg_code_dominant_10m": lambda f: f["properties"].get("tag_display_name"),
         "interpreter_name": lambda f: f["properties"].get("annotator_id"),
         "valid_year_start": lambda f: f["properties"].get("start_time"),
         "valid_year_end": lambda f: f["properties"].get("end_time"),
@@ -175,14 +176,16 @@ def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.
             continue
         row = {col: extract_value(feature, col) for col in annotation_fields}
         rows.append(row)
+    #pprint(rows)
 
     #TODO: post process the dict (or df)
 
     df = pd.DataFrame(rows)
 
-    gdf_shp = df.rename(columns=annotation_fields)
+    gdf_shp = df.rename(columns=annotation_fields) # rename geodataframe with short names for safe export to shp
     geometry = gpd.points_from_xy(gdf_shp["longitude"], gdf_shp["latitude"])
     gdf_shp = gpd.GeoDataFrame(gdf_shp.drop(columns=["latitude", "longitude"]), geometry=geometry)
+    gdf_shp = gdf_shp[[*gdf_shp.columns[:3], "geometry", *gdf_shp.columns[3:-1]]] # Reorder columns (geometry to 4th position)
     gdf_shp.set_crs('EPSG:4326', inplace=True)
     
     return df, gdf_shp
@@ -210,7 +213,7 @@ def main(config: Config):
     api.test_connection()
 
     # 2. fetch and format data
-    annotations_json = api.get_annotations(config.ess_project_id)
+    annotations_json = api.request_annotations(config.ess_project_id)
     gdf, gdf_shp = restructure_annotations(annotations_json, config)
 
     # 3. save data in local in csv and shapefile (zipped) formats. save also the raw geojson
@@ -220,7 +223,8 @@ def main(config: Config):
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(annotations_json, f, indent=2)
     gdf.to_csv(os.path.join("exported_data", f"{annotations_filename}.csv"), index=False)
-    gdf_shp.to_file(os.path.join("exported_data", f"{annotations_filename}.shp"))
+    gdf_shp.to_file(os.path.join("exported_data", f"{annotations_filename}.shp"), driver="ESRI Shapefile")
+    gdf_shp.to_file(os.path.join("exported_data", f"{annotations_filename}.geojson"), driver="GeoJSON")
 
     # Bundle all shapefile components into a zip file
     with zipfile.ZipFile(os.path.join("exported_data", f"{annotations_filename}.zip"), "w") as zipf:
@@ -235,7 +239,7 @@ def main(config: Config):
     # 4. (optionnal) save data on google cloud and google earth engine assets
     # TODO: from here, clean this into functions and make it optionnal as an option in the command line
     
-    
+    """
     # upload to GC
     upload_to_bucket(os.path.join("exported_data", f'{annotations_filename}.zip'), config.bucket_name, f'{config.blob_name}.zip')
 
@@ -263,7 +267,7 @@ def main(config: Config):
         logging.info(f'Upload to Earth Engine assets folder started successfully: {result.stdout.strip()}')
     except subprocess.CalledProcessError as e:
         logging.error(f'Error uploading to Earth Engine assets folder: {e.stderr.strip()}')
- 
+    """
     return 'Script executed successfully. Please check the Tasks section in the Google Earth Engine Code Editor for more details.', 200
 
 

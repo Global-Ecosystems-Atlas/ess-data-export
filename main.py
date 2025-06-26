@@ -87,6 +87,7 @@ class ESS_API:
 
     def test_connection(self) -> None:
         """Check if the API is reachable (note: this does not verify if the API key is valid)."""
+
         try:
             r = requests.get(f"{self.base_url}/", headers=self.headers, timeout=5)
             r.raise_for_status()
@@ -97,17 +98,30 @@ class ESS_API:
 
     def request_annotations(self, ess_project_id: str):
         """Fetch all annotations for a specific ESS project identified by its ID."""
+
         url = f"{self.base_url}/api/v1/projects/{ess_project_id}/annotations"
         r = requests.get(url, headers=self.headers)
         r.raise_for_status()
         return r.json()
     
-    def request_users(self, ess_project_id: str):
+    def request_users(self, ess_project_id: str) -> list[dict]:
         """Fetch all users for a specific ESS project identified by its ID."""
-        url = f"{self.base_url}/api/v1/projects/{ess_project_id}/users"
-        r = requests.get(url, headers=self.headers)
-        r.raise_for_status()
-        return r.json()
+
+        url_admins = f"{self.base_url}/api/v1/projects/{ess_project_id}/admins"
+        r_admins  = requests.get(url_admins, headers=self.headers)
+        r_admins.raise_for_status()
+        admins = r_admins.json()
+
+        url_users = f"{self.base_url}/api/v1/projects/{ess_project_id}/users"
+        r_users = requests.get(url_users, headers=self.headers)
+        r_users.raise_for_status()
+        users = r_users.json()
+
+        # Check for duplicates
+        combined = admins + users
+        unique_users = list({user["id"]: user for user in combined}.values())
+
+        return unique_users
 
 
 def reset_data_folder() -> None:
@@ -123,9 +137,22 @@ def get_annotations_filename(config: Config) -> str:
     return f"annotations_{timestamp}_{config.ess_project_id}"
 
 
-def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.GeoDataFrame]:
+def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.DataFrame, gpd.GeoDataFrame]:
 
-    # List of the 32 fields associated with each annotation as defined in the document 'Global Ecosystems Atlas Training Dataset: Design and Specification'.
+        # === 1. Request and validate data. ===
+
+    raw_annotations_geojson = api.request_annotations(config.ess_project_id)
+    if not raw_annotations_geojson or not raw_annotations_geojson.get('features'):
+        raise ValueError(f"No annotations found for the project {config.ess_project_id}.")
+
+    users = api.request_users(config.ess_project_id)
+    if not users:
+        raise ValueError(f"No users found for the project {config.ess_project_id}.")
+
+
+        # === 2. Map the fields from the Global Ecosystems Atlas (GEA) specification to the Earth System Studio (ESS) annotation attributes and create a dictionary where each item represents an annotation with 32 fields. ===
+
+    # List of the 32 fields associated with each annotation as defined in the document 'Global Ecosystems Atlas Training Dataset: Design and Specification'. Key = long name, value = short name (for shapefile).
     annotation_fields  = {
         "date": "date",
         "sample_id": "sample_id",
@@ -161,7 +188,11 @@ def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.
         "ess_annotation_id": "annot_id"
     }
 
-    # Field matchers for metadata_values (keys are column names in final dataframe)
+    # In Earth System Studio, an annotation has both fixed, non-editable attributes and dynamic, user-defined attributes called metadata. Metadata are stored in the 'metadata_values' attribute of an annotation.
+    # Since metadata fields in ESS are dynamic and user-defined for each project, different metadata names in different projects can refer to the same field in the GEA specification.
+    # For example, the metadata attributes 'iucn_efg_code_dominant_100m' and 'iucn_efg_code_100m' in two different ESS projects may both correspond to the same GEA specification field: 'iucn_efg_code_dominant_100m'.
+
+    # Mapping between the fields in the GEA specification and the metadata attributes of an annotation. Key = field from the specification, value = corresponding metadata attribute of an annotation in Earth System Studio.
     metadata_mapping = {
         #"iucn_efg_code_dominant_10m": ["iucn_efg_code_dominant_10m", "iucn_efg_code_10m"],
         "iucn_efg_code_secondary_10m": ["iucn_efg_code_secondary_10m"],
@@ -177,7 +208,7 @@ def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.
         "reviewer_comment": ["reviewer_comment"],
     }
 
-    # Direct mapping (from GeoJSON properties or structure)
+    # Mapping between the fields in the GEA specification and the direct attributes of an annotation. Key = field from the specification, value = corresponding direct attribute of an annotation in Earth System Studio.
     direct_mapping = {
         "latitude": lambda f: f["geometry"]["coordinates"][1],
         "longitude": lambda f: f["geometry"]["coordinates"][0],
@@ -190,7 +221,6 @@ def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.
         "reviewer_name": lambda f: f["properties"].get("reviewer_id"),
     }
 
-    # Combine both mappings
     def extract_value(feature, column: str):
         if column in direct_mapping:
             return direct_mapping[column](feature)
@@ -202,25 +232,49 @@ def restructure_annotations(geojson, config: Config) -> Tuple[pd.DataFrame, gpd.
                         return item.get("value")
         return None
 
-    # Build rows for DataFrame
-    rows = []
-    for feature in geojson["features"]:
+    # Build a dictionary of annotations where each element is an annotation with 32 fields.
+    annotations = []
+    for feature in raw_annotations_geojson["features"]:
         if feature["geometry"]["type"] != "Point":
             continue
-        row = {col: extract_value(feature, col) for col in annotation_fields}
-        rows.append(row)
+        annotation = {col: extract_value(feature, col) for col in annotation_fields}
+        annotations.append(annotation)
 
-    #TODO: post process the dict (or df)
 
-    df = pd.DataFrame(rows)
+        # === 3. Post-processing of annotations: clean up existing values and fill in missing ones. ===
 
-    gdf_shp = df.rename(columns=annotation_fields) # rename geodataframe with short names for safe export to shp
-    geometry = gpd.points_from_xy(gdf_shp["longitude"], gdf_shp["latitude"])
-    gdf_shp = gpd.GeoDataFrame(gdf_shp.drop(columns=["latitude", "longitude"]), geometry=geometry)
-    gdf_shp = gdf_shp[[*gdf_shp.columns[:3], "geometry", *gdf_shp.columns[3:-1]]] # Reorder columns (geometry to 4th position)
-    gdf_shp.set_crs('EPSG:4326', inplace=True)
+    def replace_user_ids_with_names(annotations: list[dict], users: list[dict]) -> list[dict]:
+        # Build the mapping IDs → names
+        id_to_name = {user['id']: user['name'] for user in users}
+
+        # Replace the interpreter and reviewer IDs with their names when possible
+        for annotation in annotations:
+            interpreter_id = annotation.get('interpreter_name')
+            if interpreter_id and interpreter_id in id_to_name:
+                annotation['interpreter_name'] = id_to_name[interpreter_id]
+
+            reviewer_id = annotation.get('reviewer_name')
+            if reviewer_id and reviewer_id in id_to_name:
+                annotation['reviewer_name'] = id_to_name[reviewer_id]
+
+        return annotations
+
+    annotations = replace_user_ids_with_names(annotations, users)
+
+
+        # === 4. Create the DataFrames and return the values. ===
+
+    # Regular annotations DataFrame
+    df = pd.DataFrame(annotations)
+
+    # Geospatial annotations DataFrame
+    gdf = df.rename(columns=annotation_fields)  # Rename GeoDataFrame columns with short names for safe export to shapefile
+    geometry = gpd.points_from_xy(gdf["longitude"], gdf["latitude"])
+    gdf = gpd.GeoDataFrame(gdf.drop(columns=["latitude", "longitude"]), geometry=geometry)
+    gdf = gdf[[*gdf.columns[:3], "geometry", *gdf.columns[3:-1]]]  # Reorder columns (geometry to 4th position)
+    gdf.set_crs('EPSG:4326', inplace=True)
     
-    return df, gdf_shp
+    return raw_annotations_geojson, df, gdf
 
 
 def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob_name):
@@ -240,33 +294,35 @@ def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob
 
 def main(config: Config, online_export: bool):
 
-    # === 1. Set up and test the connection to the API. ===
+        # === 1. Set up and test the connection to the API. ===
+
     api = ESS_API(config)
     api.test_connection()
 
 
-    # === 2. Retrieve and format the annotations. ===
-    annotations_json = api.request_annotations(config.ess_project_id)
-    gdf, gdf_shp = restructure_annotations(annotations_json, config)
+        # === 2. Retrieve and format the annotations. ===
+
+    raw_annotations_geojson, df, gdf = restructure_annotations(config, api)
 
 
-    # === 3. Save the annotations locally in the 'exported_data' folder as CSV, zipped Shapefile, and GeoJSON formats. Also save the raw GeoJSON as received from the API. ===
+        # === 3. Save the annotations locally in the 'exported_data' folder as CSV, zipped Shapefile, and GeoJSON formats. Also save the raw GeoJSON as received from the API. ===
+
     reset_data_folder()
     annotations_filename = get_annotations_filename(config)
 
     # Raw GeoJSON
     filepath = os.path.join("exported_data", f"raw_{annotations_filename}.geojson")
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(annotations_json, f, indent=2)
+        json.dump(raw_annotations_geojson, f, indent=2)
 
     # CSV
-    gdf.to_csv(os.path.join("exported_data", f"{annotations_filename}.csv"), index=False)
+    df.to_csv(os.path.join("exported_data", f"{annotations_filename}.csv"), index=False)
     
     # GeoJSON
-    gdf_shp.to_file(os.path.join("exported_data", f"{annotations_filename}.geojson"), driver="GeoJSON")
+    gdf.to_file(os.path.join("exported_data", f"{annotations_filename}.geojson"), driver="GeoJSON")
 
     # Zipped Shapefile
-    gdf_shp.to_file(os.path.join("exported_data", f"{annotations_filename}.shp"), driver="ESRI Shapefile")
+    gdf.to_file(os.path.join("exported_data", f"{annotations_filename}.shp"), driver="ESRI Shapefile")
     with zipfile.ZipFile(os.path.join("exported_data", f"{annotations_filename}.zip"), "w") as zipf:
         for ext in [".cpg", ".dbf", ".prj", ".shp", ".shx"]:  # List of shapefile extensions to include
             filepath = os.path.join("exported_data", f"{annotations_filename}{ext}")
@@ -277,7 +333,8 @@ def main(config: Config, online_export: bool):
                 logging.warning(f"{filepath} not found, skipping.")
 
 
-    # 4. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets using environment variable settings. ===
+        # 4. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets using environment variable settings. ===
+
     if online_export:
 
         # upload_to_GC_bucket

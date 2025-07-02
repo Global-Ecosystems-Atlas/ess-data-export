@@ -169,7 +169,7 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
         "iucn_efg_code_secondary_10m": "efg2_10m",
         "iucn_efg_code_dominant_100m": "efg_100m",
         "iucn_efg_code_secondary_100m": "efg2_100m",
-        "source": "source",
+        "data_provider": "provider",
         "data_producer": "producer",
         "interpreter_name": "int_name",
         "interpreter_confidence_level": "int_conf",
@@ -243,6 +243,17 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
 
         # === 3. Post-processing of annotations: clean up existing values and fill in missing ones. ===
 
+    constant_values = {
+        "method": "Image interpretation",  # May vary (e.g., field data), but if exported from ESS, it's almost certainly "Image interpretation".
+        "interpretation_scale_min": 10,
+        "interpretation_scale_max": 100,
+        "data_provider": "Global Ecosystem Atlas",
+        "data_producer": "JCU Global Ecology Lab"  # May vary (e.g., country mapping team or expert's institution), but if exported from ESS, it's almost certainly "JCU Global Ecology Lab".
+    }
+
+    for annotation in annotations:
+        annotation.update(constant_values)
+
     def replace_user_ids_with_names(annotations: list[dict], users: list[dict]) -> list[dict]:
         # Build the mapping IDs → names
         id_to_name = {user['id']: user['name'] for user in users}
@@ -260,6 +271,17 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
         return annotations
 
     annotations = replace_user_ids_with_names(annotations, users)
+
+
+    # TODO: columns to clean:
+
+    # convert to number: (year_start + year_end) interpretation_scale_min, interpretation_scale_max, interpreter_confidence_level, reviewer_confidence_level, homogeneity_estimate_[dominant|secondary]_10[0]m
+
+    # iucn_efg_code_[dominant|secondary]_10[0]m
+
+    # iucn_realm, iucn_biome, iucn_efg
+
+    # sample_type ("stratified" or "interactive")
 
 
         # === 4. Create the DataFrames and return the values. ===

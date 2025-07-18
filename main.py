@@ -122,6 +122,14 @@ class ESS_API:
         unique_users = list({user["id"]: user for user in combined}.values())
 
         return unique_users
+    
+    def request_metadata_report(self, ess_project_id: str):
+        """Provides a report of metadata annotations for a specific ESS project identified by its ID. Note: Only displays metadata fields that are assigned to at least one annotation."""
+
+        url = f"{self.base_url}/api/v1/projects/{ess_project_id}/metadata-report"
+        r = requests.get(url, headers=self.headers)
+        r.raise_for_status()
+        return r.json()
 
 
 def reset_data_folder() -> None:
@@ -169,7 +177,7 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
         "iucn_efg_code_secondary_10m": "efg2_10m",
         "iucn_efg_code_dominant_100m": "efg_100m",
         "iucn_efg_code_secondary_100m": "efg2_100m",
-        "data_provider": "provider",
+        "data_provider": "provider",  # Called "source" in the data specification, to be changed (in the data spec)
         "data_producer": "producer",
         "interpreter_name": "int_name",
         "interpreter_confidence_level": "int_conf",
@@ -194,12 +202,15 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
 
     # Mapping between the fields in the GEA specification and the metadata attributes of an annotation. Key = field from the specification, value = corresponding metadata attribute of an annotation in Earth System Studio.
     metadata_mapping = {
+        "sample_id": ["sample_id"],
+        "reference_grid_id": ["grid_id"],
         #"iucn_efg_code_dominant_10m": ["iucn_efg_code_dominant_10m", "iucn_efg_code_10m"],
         "iucn_efg_code_secondary_10m": ["iucn_efg_code_secondary_10m"],
         "iucn_efg_code_dominant_100m": ["iucn_efg_code_dominant_100m", "iucn_efg_code_100m", "Iucn_efg_code_100m"],
         "iucn_efg_code_secondary_100m": ["iucn_efg_code_secondary_100m"],
         "interpreter_confidence_level": ["interpreter_confidence_level", "interpreter_confidence (1-5)"],
         "reviewer_confidence_level": ["reviewer_confidence_level", "reviewer_confidence (1-5)"],
+        "sample_type": ["sample_type"],
         "homogeneity_estimate_dominant_10m": ["homogeneity_estimate_dominant_10m", "homogeneity_estimate_10m"],
         "homogeneity_estimate_secondary_10m": ["homogeneity_estimate_secondary_10m"],
         "homogeneity_estimate_dominant_100m": ["homogeneity_estimate_dominant_100m", "homogeneity_estimate_100m"],
@@ -210,8 +221,8 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
 
     # Mapping between the fields in the GEA specification and the direct attributes of an annotation. Key = field from the specification, value = corresponding direct attribute of an annotation in Earth System Studio.
     direct_mapping = {
-        "latitude": lambda f: f["geometry"]["coordinates"][1],
-        "longitude": lambda f: f["geometry"]["coordinates"][0],
+        "latitude": lambda f: round(f["geometry"]["coordinates"][1], 6),  # Rounding to 6 decimal places ensures stability up to ~10 cm precision, which is usually sufficient for geographic data.
+        "longitude": lambda f: round(f["geometry"]["coordinates"][0], 6),
         "iucn_efg_code_dominant_10m": lambda f: f["properties"].get("tag_display_name"),
         "interpreter_name": lambda f: f["properties"].get("annotator_id"),
         "valid_year_start": lambda f: f["properties"].get("start_time"),
@@ -243,6 +254,16 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
 
         # === 3. Post-processing of annotations: clean up existing values and fill in missing ones. ===
 
+    df = pd.DataFrame(annotations)
+
+    # 1. Clean columns types
+    columns_to_int = ['interpreter_confidence_level', 'reviewer_confidence_level']
+    df[columns_to_int] = df[columns_to_int].astype('UInt8')  # No need for extra checks here, confidence levels in ESS are supposed to be restricted to values between 1 and 5.
+    
+    columns_to_float = ['homogeneity_estimate_dominant_10m', 'homogeneity_estimate_secondary_10m', 'homogeneity_estimate_dominant_100m', 'homogeneity_estimate_secondary_100m']
+    df[columns_to_float] = df[columns_to_float].astype("Float32")  # No need for extra checks here, homogeneity values in ESS are supposed to be restricted to between 0 and 100.
+
+    # 2. Fill columns with constant values
     constant_values = {
         "method": "Image interpretation",  # May vary (e.g., field data), but if exported from ESS, it's almost certainly "Image interpretation".
         "interpretation_scale_min": 10,
@@ -251,51 +272,33 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
         "data_producer": "JCU Global Ecology Lab"  # May vary (e.g., country mapping team or expert's institution), but if exported from ESS, it's almost certainly "JCU Global Ecology Lab".
     }
 
-    for annotation in annotations:
-        annotation.update(constant_values)
+    for field, value in constant_values.items():
+        df[field] = value
 
-    def replace_user_ids_with_names(annotations: list[dict], users: list[dict]) -> list[dict]:
-        # Build the mapping IDs → names
-        id_to_name = {user['id']: user['name'] for user in users}
+    # 3. Set sample type to "Interactive" for projects where the 'sample_type' metadata is present (do not fill anything for projects where the metadata is not present [Indo-Pacific Attols, Antarctic, Arctic]).
+    metadata_report = api.request_metadata_report(config.ess_project_id)
+    if any(d['metadata_name'] == 'sample_type' for d in metadata_report):
+        df['sample_type'] = df['sample_type'].fillna("Interactive")
 
-        # Replace the interpreter and reviewer IDs with their names when possible
-        for annotation in annotations:
-            interpreter_id = annotation.get('interpreter_name')
-            if interpreter_id and interpreter_id in id_to_name:
-                annotation['interpreter_name'] = id_to_name[interpreter_id]
+    # 4. Replace the interpreter and reviewer IDs with their names when possible
+    id_to_name = {user['id']: user['name'] for user in users}  # Build the mapping IDs → names
+    df['interpreter_name'] = df['interpreter_name'].map(id_to_name).fillna(df['interpreter_name'])
+    df['reviewer_name'] = df['reviewer_name'].map(id_to_name).fillna(df['reviewer_name'])
 
-            reviewer_id = annotation.get('reviewer_name')
-            if reviewer_id and reviewer_id in id_to_name:
-                annotation['reviewer_name'] = id_to_name[reviewer_id]
-
-        return annotations
-
-    annotations = replace_user_ids_with_names(annotations, users)
-
-
-    # TODO: columns to clean:
-
-    # convert to number: (year_start + year_end) interpretation_scale_min, interpretation_scale_max, interpreter_confidence_level, reviewer_confidence_level, homogeneity_estimate_[dominant|secondary]_10[0]m
+    # TODO: other columns to clean:
 
     # iucn_efg_code_[dominant|secondary]_10[0]m
 
     # iucn_realm, iucn_biome, iucn_efg
 
-    # sample_type ("stratified" or "interactive")
 
-
-        # === 4. Create the DataFrames and return the values. ===
-
-    # Regular annotations DataFrame
-    df = pd.DataFrame(annotations)
+        # === 4. Return the values. ===
 
     # Geospatial annotations DataFrame
     gdf = df.rename(columns=annotation_fields)  # Rename GeoDataFrame columns with short names for safe export to shapefile
-    geometry = gpd.points_from_xy(gdf["longitude"], gdf["latitude"])
-    gdf = gpd.GeoDataFrame(gdf.drop(columns=["latitude", "longitude"]), geometry=geometry)
+    gdf = gpd.GeoDataFrame(gdf, geometry=gpd.points_from_xy(df["longitude"], df["latitude"]), crs="EPSG:4326")
     gdf = gdf[[*gdf.columns[:3], "geometry", *gdf.columns[3:-1]]]  # Reorder columns (geometry to 4th position)
-    gdf.set_crs('EPSG:4326', inplace=True)
-    
+
     return raw_annotations_geojson, df, gdf
 
 

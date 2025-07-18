@@ -212,9 +212,9 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
         "reviewer_confidence_level": ["reviewer_confidence_level", "reviewer_confidence (1-5)"],
         "sample_type": ["sample_type"],
         "homogeneity_estimate_dominant_10m": ["homogeneity_estimate_dominant_10m", "homogeneity_estimate_10m"],
-        "homogeneity_estimate_secondary_10m": ["homogeneity_estimate_secondary_10m"],
+        "homogeneity_estimate_secondary_10m": ["homogeneity_estimate_secondary_10m", "2nd_dom_efg_code_homogeneity_10m"],
         "homogeneity_estimate_dominant_100m": ["homogeneity_estimate_dominant_100m", "homogeneity_estimate_100m"],
-        "homogeneity_estimate_secondary_100m": ["homogeneity_estimate_secondary_100m"],
+        "homogeneity_estimate_secondary_100m": ["homogeneity_estimate_secondary_100m", "2nd_dom_efg_code_homogeneity_100m"],
         "interpreter_comment": ["interpreter_comment"],
         "reviewer_comment": ["reviewer_comment"],
     }
@@ -263,7 +263,21 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
     columns_to_float = ['homogeneity_estimate_dominant_10m', 'homogeneity_estimate_secondary_10m', 'homogeneity_estimate_dominant_100m', 'homogeneity_estimate_secondary_100m']
     df[columns_to_float] = df[columns_to_float].astype("Float32")  # No need for extra checks here, homogeneity values in ESS are supposed to be restricted to between 0 and 100.
 
-    # 2. Fill columns with constant values
+    # 2. Check for possible data entry errors where homogeneity estimates exceed 100% when adding dominant and secondary EFG.
+    sum_10m = df[['homogeneity_estimate_dominant_10m','homogeneity_estimate_secondary_10m']].sum(axis=1, skipna=True)
+    sum_100m = df[['homogeneity_estimate_dominant_100m','homogeneity_estimate_secondary_100m']].sum(axis=1, skipna=True)
+    invalid_homogeneities = (sum_10m > 100) | (sum_100m > 100)
+
+    if invalid_homogeneities.any():
+        error_msg = []
+        for i in df[invalid_homogeneities].index:
+            if sum_10m[i] > 100:
+                error_msg.append(f"{sum_10m[i]}% for homogeneity at 10m in annotation '{df.at[i, 'ess_annotation_id']}' of task '{df.at[i, 'ess_task_id']}'")
+            if sum_100m[i] > 100:
+                error_msg.append(f"{sum_100m[i]}% for homogeneity at 100m in annotation '{df.at[i, 'ess_annotation_id']}' of task '{df.at[i, 'ess_task_id']}'")
+        raise ValueError("Homogeneity values exceed 100% in the following annotations:\n" + "\n".join(error_msg))
+
+    # 3. Fill columns with constant values
     constant_values = {
         "method": "Image interpretation",  # May vary (e.g., field data), but if exported from ESS, it's almost certainly "Image interpretation".
         "interpretation_scale_min": 10,
@@ -275,12 +289,12 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
     for field, value in constant_values.items():
         df[field] = value
 
-    # 3. Set sample type to "Interactive" for projects where the 'sample_type' metadata is present (do not fill anything for projects where the metadata is not present [Indo-Pacific Attols, Antarctic, Arctic]).
+    # 4. Set sample type to "Interactive" for projects where the 'sample_type' metadata is present (do not fill anything for projects where the metadata is not present [Indo-Pacific Attols, Antarctic, Arctic]).
     metadata_report = api.request_metadata_report(config.ess_project_id)
     if any(d['metadata_name'] == 'sample_type' for d in metadata_report):
         df['sample_type'] = df['sample_type'].fillna("Interactive")
 
-    # 4. Replace the interpreter and reviewer IDs with their names when possible
+    # 5. Replace the interpreter and reviewer IDs with their names when possible
     id_to_name = {user['id']: user['name'] for user in users}  # Build the mapping IDs → names
     df['interpreter_name'] = df['interpreter_name'].map(id_to_name).fillna(df['interpreter_name'])
     df['reviewer_name'] = df['reviewer_name'].map(id_to_name).fillna(df['reviewer_name'])

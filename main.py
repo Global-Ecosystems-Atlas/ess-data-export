@@ -212,24 +212,25 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
         "reviewer_confidence_level": ["reviewer_confidence_level", "reviewer_confidence (1-5)"],
         "sample_type": ["sample_type"],
         "homogeneity_estimate_dominant_10m": ["homogeneity_estimate_dominant_10m", "homogeneity_estimate_10m"],
-        "homogeneity_estimate_secondary_10m": ["homogeneity_estimate_secondary_10m", "2nd_dom_efg_code_homogeneity_10m"],
+        "homogeneity_estimate_secondary_10m": ["homogeneity_estimate_secondary_10m"],
         "homogeneity_estimate_dominant_100m": ["homogeneity_estimate_dominant_100m", "homogeneity_estimate_100m"],
-        "homogeneity_estimate_secondary_100m": ["homogeneity_estimate_secondary_100m", "2nd_dom_efg_code_homogeneity_100m"],
+        "homogeneity_estimate_secondary_100m": ["homogeneity_estimate_secondary_100m"],
         "interpreter_comment": ["interpreter_comment"],
         "reviewer_comment": ["reviewer_comment"],
     }
 
     # Mapping between the fields in the GEA specification and the direct attributes of an annotation. Key = field from the specification, value = corresponding direct attribute of an annotation in Earth System Studio.
     direct_mapping = {
+        "date": lambda f: f["properties"].get("updated_time"),
         "latitude": lambda f: round(f["geometry"]["coordinates"][1], 6),  # Rounding to 6 decimal places ensures stability up to ~10 cm precision, which is usually sufficient for geographic data.
         "longitude": lambda f: round(f["geometry"]["coordinates"][0], 6),
         "iucn_efg_code_dominant_10m": lambda f: f["properties"].get("tag_display_name"),
         "interpreter_name": lambda f: f["properties"].get("annotator_id"),
+        "reviewer_name": lambda f: f["properties"].get("reviewer_id"),
         "valid_year_start": lambda f: f["properties"].get("start_time"),
         "valid_year_end": lambda f: f["properties"].get("end_time"),
         "ess_task_id": lambda f: f["properties"].get("task_id"),
         "ess_annotation_id": lambda f: f["properties"].get("id"),
-        "reviewer_name": lambda f: f["properties"].get("reviewer_id"),
     }
 
     def extract_value(feature, column: str):
@@ -256,12 +257,16 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
 
     df = pd.DataFrame(annotations)
 
-    # 1. Clean columns types
+    # 1. Clean column types and formats
     columns_to_int = ['interpreter_confidence_level', 'reviewer_confidence_level']
     df[columns_to_int] = df[columns_to_int].astype('UInt8')  # No need for extra checks here, confidence levels in ESS are supposed to be restricted to values between 1 and 5.
     
     columns_to_float = ['homogeneity_estimate_dominant_10m', 'homogeneity_estimate_secondary_10m', 'homogeneity_estimate_dominant_100m', 'homogeneity_estimate_secondary_100m']
     df[columns_to_float] = df[columns_to_float].astype("Float32")  # No need for extra checks here, homogeneity values in ESS are supposed to be restricted to between 0 and 100.
+
+    columns_to_date = ["date", "valid_year_start", "valid_year_end"]
+    df[columns_to_date] = df[columns_to_date].apply(lambda col: pd.to_datetime(col, format='mixed', utc=True).dt.strftime("%d-%m-%Y"))
+
 
     # 2. Check for possible data entry errors where homogeneity estimates exceed 100% when adding dominant and secondary EFG.
     sum_10m = df[['homogeneity_estimate_dominant_10m','homogeneity_estimate_secondary_10m']].sum(axis=1, skipna=True)
@@ -277,6 +282,7 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
                 error_msg.append(f"{sum_100m[i]}% for homogeneity at 100m in annotation '{df.at[i, 'ess_annotation_id']}' of task '{df.at[i, 'ess_task_id']}'")
         raise ValueError("Homogeneity values exceed 100% in the following annotations:\n" + "\n".join(error_msg))
 
+
     # 3. Fill columns with constant values
     constant_values = {
         "method": "Image interpretation",  # May vary (e.g., field data), but if exported from ESS, it's almost certainly "Image interpretation".
@@ -289,10 +295,12 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
     for field, value in constant_values.items():
         df[field] = value
 
+
     # 4. Set sample type to "Interactive" for projects where the 'sample_type' metadata is present (do not fill anything for projects where the metadata is not present [Indo-Pacific Attols, Antarctic, Arctic]).
     metadata_report = api.request_metadata_report(config.ess_project_id)
     if any(d['metadata_name'] == 'sample_type' for d in metadata_report):
         df['sample_type'] = df['sample_type'].fillna("Interactive")
+
 
     # 5. Replace the interpreter and reviewer IDs with their names when possible
     id_to_name = {user['id']: user['name'] for user in users}  # Build the mapping IDs → names

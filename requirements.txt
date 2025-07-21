@@ -2,6 +2,7 @@ earthengine-api
 functions-framework
 geopandas
 google-cloud-storage
+openpyxl
 pandas
 python-dotenv
 requests

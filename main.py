@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pandas as pd
+import re
 import requests
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from google.cloud import storage
 from pprint import pprint
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 """
@@ -307,11 +308,49 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
     df['interpreter_name'] = df['interpreter_name'].map(id_to_name).fillna(df['interpreter_name'])
     df['reviewer_name'] = df['reviewer_name'].map(id_to_name).fillna(df['reviewer_name'])
 
-    # TODO: other columns to clean:
 
-    # iucn_efg_code_[dominant|secondary]_10[0]m
+    # 6. Set the EFG codes for dominant and secondary EFGs at 10m and 100m, and set the character strings for the dominant EFG at 100m.
+    def extract_IUCN_codes(input_str: str) -> Optional[Tuple[str, str, str]]:
+        """Analyse a character string and identify whether an EFG code is present. If so, return a tuple of three values: the realm code, biome code, and EFG code. Otherwise, return None."""
+        
+        codes = None
 
-    # iucn_realm, iucn_biome, iucn_efg
+        if input_str:
+            match = re.match(r'^([A-Z]{1,3})_(\d{1,2})_(\d{1,2})', input_str.strip(), re.IGNORECASE)  # Match pattern: 1-3 letters + "_" + 1-2 digits + "_" + 1-2 digits
+            if match:
+                realm, biome, efg = match.groups()
+                realm = realm.upper()
+                codes = (realm, f"{realm}{biome}", f"{realm}{biome}.{efg}")
+        
+        return codes
+
+    def load_IUCN_codes_dict(excel_path, sheet_name=0):
+        """Open an .xlsx file and returns a dictionary mapping 'code' to 'name', if both columns are present."""
+
+        df = pd.read_excel(excel_path, sheet_name=sheet_name)
+
+        if 'code' not in df.columns or 'name' not in df.columns:
+            raise ValueError(f"Missing 'code' or 'name' columns in {excel_path}")
+        
+        return dict(zip(df['code'], df['name']))
+
+    dict_realms = load_IUCN_codes_dict(os.path.join("resources", "IUCN-GET-realms.xlsx"))  # Would be nice if this information could be retrieved from a GET site API
+    dict_biomes = load_IUCN_codes_dict(os.path.join("resources", "IUCN-GET-biomes.xlsx"))
+    dict_efgs = load_IUCN_codes_dict(os.path.join("resources", "IUCN-GET-profiles-exported-2023-06-14.xlsx"), sheet_name="Short description")
+
+    # Set the realm, biome, and EFG names for the dominant EFG at 100m.
+    df[['iucn_realm', 'iucn_biome', 'iucn_ecosystem_functional_group']] = df['iucn_efg_code_dominant_100m'].apply(  # TODO: Check that it's for the code at 100m and not 10m
+        lambda v: pd.Series((
+            dict_realms.get(codes[0]) if (codes := extract_IUCN_codes(v)) else None,
+            dict_biomes.get(codes[1]) if codes else None,
+            dict_efgs.get(codes[2]) if codes else None
+        ))
+    )
+
+    # Set the EFG codes for dominant and secondary values at 10m and 100m.
+    cols_to_update = ['iucn_efg_code_dominant_10m', 'iucn_efg_code_secondary_10m', 'iucn_efg_code_dominant_100m', 'iucn_efg_code_secondary_100m']
+    for col in cols_to_update:
+        df[col] = df[col].apply(lambda v: codes[2] if (codes := extract_IUCN_codes(v)) else v)
 
 
         # === 4. Return the values. ===
@@ -325,7 +364,7 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
 
 
 def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob_name):
-    """Uploads a file to the specified Cloud Storage bucket."""
+    """Upload a file to the specified Cloud Storage bucket."""
 
     client = storage.Client()
     bucket = client.bucket(destination_bucket_name)

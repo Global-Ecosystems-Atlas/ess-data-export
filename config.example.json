@@ -1,0 +1,18 @@
+{
+  "env": "[OPTIONAL] Defaults to 'prod'",
+  "gc_project_id": "[OPTIONAL] Defaults to 'geo-global-ecosystems-atlas'",
+  "ess_projects": [
+    {
+      "ess_project_id": "example-project-1-id  // [REQUIRED]",
+      "gc_bucket_name": "example-bucket-id  // [REQUIRED if online export]",
+      "gc_blob_name": "example/path/to/blob-1  // [REQUIRED if online export]",
+      "gee_asset_id": "example/path/to/asset-1  // [REQUIRED if online export]"
+    },
+    {
+      "ess_project_id": "c903wj55-d12b-4f42-3146-3a8a9e23863a",
+      "gc_bucket_name": "earth-system-studio",
+      "gc_blob_name": "training_data/maldives_training_data",
+      "gee_asset_id": "projects/global-ecosystems-atlas/assets/training_data/maldives_training_data"
+    }
+  ]
+}

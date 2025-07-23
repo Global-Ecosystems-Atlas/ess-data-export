@@ -23,13 +23,13 @@ This script exports annotations from an Earth System Studio (ESS) project into a
 If run with the '--online-export' flag, the annotations are also uploaded to Google Cloud Storage (GCS) and Google Earth Engine (GEE).
 
 The script performs the following steps:
-1. Verifies all prerequisites, including required environment variables and API connectivity.
-2. Retrieves and formats annotations from the ESS project defined by the 'ESS_PROJECT_ID' environment variable.
+1. Verifies all prerequisites, including the configuration file, environment variables, and API connectivity.
+2. Retrieves and formats annotations from the ESS projects defined under the 'ess_projects' key in the 'config.json' configuration file (see 'config.example.json').
 3. Exports the annotations to the 'exported_data' folder in CSV, zipped Shapefile, and GeoJSON formats.
 
 Optional (enabled with '--online-export'):
-4. Uploads the zipped Shapefile to the GCS bucket specified by the 'BUCKET_NAME' and 'BLOB_NAME' environment variables.
-5. Transfers the zipped Shapefile from GCS to the Earth Engine asset defined by the 'GEE_ASSET_ID' environment variable.
+4. Uploads the zipped Shapefiles to the GCS bucket specified by the 'gc_bucket_name' and 'gc_blob_name' keys in the configuration file.
+5. Transfers the zipped Shapefiles from GCS to the Earth Engine asset defined by the 'gee_asset_id' key in the configuration file.
 """
 
 # Configure logging
@@ -39,42 +39,57 @@ if not logging.getLogger().hasHandlers():
 
 class Config:
     """
-    Class responsible for loading and validating all required environment variables needed to execute the annotation export script. 
-    It ensures that the configuration is complete and that optional variables are only validated when necessary (for online export).
+    Class responsible for loading and validating all configuration variables required to run the annotation export script. 
+    Loads non-sensitive settings from 'config.json', sensitive data (e.g., API key) from environment variables in a .env file, and additional parameters from command-line arguments.
     """
 
     def __init__(self, online_export=False):
-        load_dotenv()
+        
+            # === 1. Variable retrieved from the command line ===
+
         self.online_export = online_export
 
-        # Required environment variables
-        self.api_key = os.getenv("API_KEY") # Earth System Studio API key
-        self.ess_project_id = os.getenv("ESS_PROJECT_ID") # Earth System Studio project ID
-        self.env = os.getenv("ENV", "prod").lower() # Environment: development (dev) or production (prod), default to 'prod'
 
-        # Optional environment variables
-        self.blob_name = os.getenv("BLOB_NAME") # Google Cloud Storage blob name
-        self.bucket_name = os.getenv("BUCKET_NAME") # Google Cloud Storage bucket name
-        self.gc_project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "geo-global-ecosystems-atlas") # Google Cloud project ID, default to 'geo-global-ecosystems-atlas'. Accessible if the code is running on Google Cloud Run.
-        self.gee_asset_id = os.getenv("GEE_ASSET_ID") # Google Earth Engine asset ID
+            # === 2. Variable retrieved from environment variables (.env file, secret variable)
 
-        self.validate()
+        load_dotenv()
+        self.api_key = os.getenv("API_KEY")  # Earth System Studio API key
 
-    def validate(self):
-        # Required environment variables
-        required_vars = ["api_key", "ess_project_id", "env"]
+        if not self.api_key:
+            raise ValueError("Missing required environment variable 'API_KEY'.")
 
-        # Optional environment variables (required if online_export == True)
-        if self.online_export:
-            required_vars += ["blob_name", "bucket_name", "gc_project_id", "gee_asset_id"]
 
-        missing = [name for name in required_vars if getattr(self, name) in (None, "")]
+            # === 3. Variables retrieved from the JSON config file (JSON file, non-secret variables)
 
-        if missing:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing)}.")
+        if not os.path.exists("config.json"):
+            raise FileNotFoundError("Configuration file 'config.json' not found.")
+        
+        with open("config.json", "r", encoding="utf-8") as f:
+            config_data = json.load(f)
 
+        self.gc_project_id = config_data.get("gc_project_id", "geo-global-ecosystems-atlas")  # Google Cloud project ID, default to 'geo-global-ecosystems-atlas'. Accessible as an environement variable (GOOGLE_CLOUD_PROJECT) if the code is running on Google Cloud Run.
+
+        self.env = config_data.get("env", "prod").lower()  # Environment: development (dev) or production (prod), default to 'prod'
+        
         if self.env not in ("dev", "prod"):
-            raise ValueError("The environment variable ENV must be set to 'dev' or 'prod'.")
+            raise ValueError("The 'env' key in the config file 'config.json' must be set to 'dev' or 'prod'.")
+        
+        self.ess_projects = config_data.get("ess_projects")
+
+        if not isinstance(self.ess_projects, list) or not self.ess_projects:
+            raise ValueError("The config file 'config.json' must contain at least one Earth System Studio project in the 'ess_projects' list.")
+
+        for project in self.ess_projects:
+            if not isinstance(project, dict):
+                raise ValueError("Each project defined in the 'ess_projects' list of the config file 'config.json' must be a dictionary.")
+
+            if not project.get("ess_project_id"):
+                raise ValueError("Each project defined in the 'ess_projects' list of the config file 'config.json' must have a set 'ess_project_id' key.")
+
+            if online_export:
+                missing_keys = [key for key in ("gc_bucket_name", "gc_blob_name", "gee_asset_id") if not project.get(key)]
+                if missing_keys:
+                    raise ValueError(f"Missing required keys for online export in project '{project.get('ess_project_id')}': {', '.join(missing_keys)}")
 
 
 class ESS_API:
@@ -131,6 +146,14 @@ class ESS_API:
         r = requests.get(url, headers=self.headers)
         r.raise_for_status()
         return r.json()
+    
+    def request_project_name(self, ess_project_id: str):
+        """Fetch the project name for a specific ESS project identified by its ID."""
+
+        url = f"{self.base_url}/api/v1/projects/{ess_project_id}"
+        r = requests.get(url, headers=self.headers)
+        r.raise_for_status()
+        return r.json()["name"]
 
 
 def reset_data_folder() -> None:
@@ -138,25 +161,39 @@ def reset_data_folder() -> None:
 
     if os.path.exists("exported_data"):
         shutil.rmtree("exported_data")
+
     os.makedirs("exported_data")
 
 
-def get_annotations_filename(config: Config) -> str:
+def create_project_data_folder(ess_project_name: str) -> str:
+    """Create a folder inside the 'exported_data' directory using the given ESS project name and return its path."""
+
+    folder_path = os.path.join("exported_data", ess_project_name)
+
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+
+    return folder_path
+
+
+def get_annotations_filename(ess_project_id: str) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return f"annotations_{timestamp}_{config.ess_project_id}"
+    return f"annotations_{timestamp}_{ess_project_id}"
 
 
-def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.DataFrame, gpd.GeoDataFrame]:
+def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd.DataFrame, gpd.GeoDataFrame]:
 
         # === 1. Request and validate data. ===
 
-    raw_annotations_geojson = api.request_annotations(config.ess_project_id)
-    if not raw_annotations_geojson or not raw_annotations_geojson.get('features'):
-        raise ValueError(f"No annotations found for the project {config.ess_project_id}.")
+    ess_project_name = api.request_project_name(ess_project_id)
 
-    users = api.request_users(config.ess_project_id)
+    raw_annotations_geojson = api.request_annotations(ess_project_id)
+    if not raw_annotations_geojson or not raw_annotations_geojson.get('features'):
+        raise ValueError(f"No annotations found for the project {ess_project_name} ({ess_project_id}).")
+
+    users = api.request_users(ess_project_id)
     if not users:
-        raise ValueError(f"No users found for the project {config.ess_project_id}.")
+        raise ValueError(f"No users found for the project {ess_project_name} ({ess_project_id}).")
 
 
         # === 2. Map the fields from the Global Ecosystems Atlas (GEA) specification to the Earth System Studio (ESS) annotation attributes and create a dictionary where each item represents an annotation with 32 fields. ===
@@ -245,18 +282,23 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
                         return item.get("value")
         return None
 
-    # Build a dictionary of annotations where each element is an annotation with 32 fields.
-    annotations = []
+    # Build a dataframe of annotations where each row is an annotation with 32 fields (+ an additional DataFrame with extra information, not intended for export but useful for processing).
+    annotations, annotations_extra = [], []
+
     for feature in raw_annotations_geojson["features"]:
         if feature["geometry"]["type"] != "Point":
             continue
+
         annotation = {col: extract_value(feature, col) for col in annotation_fields}
         annotations.append(annotation)
 
+        annotation_extra = {'ess_annotation_id': feature["properties"].get("id"), 'ess_task_name': feature["properties"].get("task_name"), 'ess_task_status': feature["properties"].get("task_status")}
+        annotations_extra.append(annotation_extra)
+
+    df, df_extra = pd.DataFrame(annotations), pd.DataFrame(annotations_extra)
+
 
         # === 3. Post-processing of annotations: clean up existing values and fill in missing ones. ===
-
-    df = pd.DataFrame(annotations)
 
     # 1. Clean column types and formats
     columns_to_int = ['interpreter_confidence_level', 'reviewer_confidence_level']
@@ -277,11 +319,14 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
     if invalid_homogeneities.any():
         error_msg = []
         for i in df[invalid_homogeneities].index:
+            ess_annotation_id = df.at[i, 'ess_annotation_id']
+            ess_task_name = df_extra.loc[df_extra['ess_annotation_id'] == ess_annotation_id, 'ess_task_name'].values[0]
             if sum_10m[i] > 100:
-                error_msg.append(f"{sum_10m[i]}% for homogeneity at 10m in annotation '{df.at[i, 'ess_annotation_id']}' of task '{df.at[i, 'ess_task_id']}'")
+                error_msg.append(f"{sum_10m[i]}% for homogeneity at 10m in annotation '{ess_annotation_id}' of task '{ess_task_name}'")
             if sum_100m[i] > 100:
-                error_msg.append(f"{sum_100m[i]}% for homogeneity at 100m in annotation '{df.at[i, 'ess_annotation_id']}' of task '{df.at[i, 'ess_task_id']}'")
-        raise ValueError("Homogeneity values exceed 100% in the following annotations:\n" + "\n".join(error_msg))
+                error_msg.append(f"{sum_100m[i]}% for homogeneity at 100m in annotation '{ess_annotation_id}' of task '{ess_task_name}'")
+
+        raise ValueError(f"In project {ess_project_name}, homogeneity values exceed 100% in the following annotations:\n" + "\n".join(error_msg))
 
 
     # 3. Fill columns with constant values
@@ -298,7 +343,7 @@ def restructure_annotations(config: Config, api: ESS_API) -> Tuple[dict, pd.Data
 
 
     # 4. Set sample type to "Interactive" for projects where the 'sample_type' metadata is present (do not fill anything for projects where the metadata is not present [Indo-Pacific Attols, Antarctic, Arctic]).
-    metadata_report = api.request_metadata_report(config.ess_project_id)
+    metadata_report = api.request_metadata_report(ess_project_id)
     if any(d['metadata_name'] == 'sample_type' for d in metadata_report):
         df['sample_type'] = df['sample_type'].fillna("Interactive")
 
@@ -380,76 +425,89 @@ def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob
 
 def main(config: Config, online_export: bool):
 
-        # === 1. Set up and test the connection to the API. ===
+        # === 1. Set up and test the API connection, and reset the data folder. ===
 
     api = ESS_API(config)
     api.test_connection()
-
-
-        # === 2. Retrieve and format the annotations. ===
-
-    raw_annotations_geojson, df, gdf = restructure_annotations(config, api)
-
-
-        # === 3. Save the annotations locally in the 'exported_data' folder as CSV, zipped Shapefile, and GeoJSON formats. Also save the raw GeoJSON as received from the API. ===
-
     reset_data_folder()
-    annotations_filename = get_annotations_filename(config)
-
-    # Raw GeoJSON
-    filepath = os.path.join("exported_data", f"raw_{annotations_filename}.geojson")
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(raw_annotations_geojson, f, indent=2)
-
-    # CSV
-    df.to_csv(os.path.join("exported_data", f"{annotations_filename}.csv"), index=False)
-    
-    # GeoJSON
-    gdf.to_file(os.path.join("exported_data", f"{annotations_filename}.geojson"), driver="GeoJSON")
-
-    # Zipped Shapefile
-    gdf.to_file(os.path.join("exported_data", f"{annotations_filename}.shp"), driver="ESRI Shapefile")
-    with zipfile.ZipFile(os.path.join("exported_data", f"{annotations_filename}.zip"), "w") as zipf:
-        for ext in [".cpg", ".dbf", ".prj", ".shp", ".shx"]:  # List of shapefile extensions to include
-            filepath = os.path.join("exported_data", f"{annotations_filename}{ext}")
-            if os.path.exists(filepath):
-                zipf.write(filepath, arcname=f"{annotations_filename}{ext}")
-                os.remove(filepath)
-            else:
-                logging.warning(f"{filepath} not found, skipping.")
 
 
-        # 4. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets using environment variable settings. ===
+    # Loop through all ESS projects specified in the configuration file 'config.json'.
+    for i, ess_project in enumerate(config.ess_projects, start=1):
 
+
+            # === 2. Retrieve and format the annotations. ===
+
+        ess_project_id = ess_project.get('ess_project_id')
+        ess_project_name = api.request_project_name(ess_project_id)
+
+        raw_annotations_geojson, df, gdf = restructure_annotations(ess_project_id, api)
+
+
+            # === 3. Save the annotations locally in the 'exported_data' folder as CSV, zipped Shapefile, and GeoJSON formats. Also save the raw GeoJSON as received from the API. ===
+
+        annotations_filename = get_annotations_filename(ess_project_id)
+        folder_path = create_project_data_folder(ess_project_name)
+
+        # Raw GeoJSON
+        with open(os.path.join(folder_path, f"raw_{annotations_filename}.geojson"), "w", encoding="utf-8") as f:
+            json.dump(raw_annotations_geojson, f, indent=2)
+
+        # CSV
+        df.to_csv(os.path.join(folder_path, f"{annotations_filename}.csv"), index=False)
+        
+        # GeoJSON
+        gdf.to_file(os.path.join(folder_path, f"{annotations_filename}.geojson"), driver="GeoJSON")
+
+        # Zipped Shapefile
+        gdf.to_file(os.path.join(folder_path, f"{annotations_filename}.shp"), driver="ESRI Shapefile")
+        with zipfile.ZipFile(os.path.join(folder_path, f"{annotations_filename}.zip"), "w") as zipf:
+            for ext in [".cpg", ".dbf", ".prj", ".shp", ".shx"]:  # List of shapefile extensions to include
+                file_path = os.path.join(folder_path, f"{annotations_filename}{ext}")
+                if os.path.exists(file_path):
+                    zipf.write(file_path, arcname=f"{annotations_filename}{ext}")
+                    os.remove(file_path)
+                else:
+                    logging.warning(f"{file_path} not found, skipping.")
+
+
+            # 4. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets using environment variable settings. ===
+
+        if online_export:
+
+            gc_bucket_name, gc_blob_name, gee_asset_id = ess_project.get('gc_bucket_name'), ess_project.get('gc_blob_name'), ess_project.get('gee_asset_id')
+
+            # upload_to_GC_bucket
+            upload_to_bucket(os.path.join(folder_path, f'{annotations_filename}.zip'), gc_bucket_name, f'{gc_blob_name}.zip')
+
+            # upload_to_EE_assets  # TODO: put EE export in a function
+            ee.Authenticate()
+            ee.Initialize(project=config.gc_project_id)
+
+            # Delete the old Earth Engine asset if it exists
+            try:
+                info = ee.data.getInfo(gee_asset_id)
+                if info:
+                    ee.data.deleteAsset(gee_asset_id)
+                    logging.info(f'The asset {gee_asset_id} already existed and has been overwritten.')
+            except Exception as e:
+                logging.error(f'Error checking asset: {e}')
+
+            # Build the Earth Engine CLI command to upload the zipped shapefile from the bucket to the Earth Engine assets folder
+            cmd = ['earthengine', 'upload', 'table', f'--asset_id={gee_asset_id}', f'gs://{gc_bucket_name}/{gc_blob_name}.zip']
+
+            # Run the command
+            try:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                logging.info(f'Upload to Earth Engine assets folder started successfully: {result.stdout.strip()}')
+            except subprocess.CalledProcessError as e:
+                logging.error(f'Error uploading to Earth Engine assets folder: {e.stderr.strip()}')
+
+
+    msg = f"Script executed successfully with {i} project{'s' if i != 1 else ''} exported."
     if online_export:
-
-        # upload_to_GC_bucket
-        upload_to_bucket(os.path.join("exported_data", f'{annotations_filename}.zip'), config.bucket_name, f'{config.blob_name}.zip')
-
-        # upload_to_EE_assets  # TODO: put EE export in a function
-        ee.Authenticate()
-        ee.Initialize(project=config.gc_project_id)
-
-        # Delete the old Earth Engine asset if it exists
-        try:
-            info = ee.data.getInfo(config.gee_asset_id)
-            if info:
-                ee.data.deleteAsset(config.gee_asset_id)
-                logging.info(f'The asset {config.gee_asset_id} already existed and has been overwritten.')
-        except Exception as e:
-            logging.error(f'Error checking asset: {e}')
-
-        # Build the Earth Engine CLI command to upload the zipped shapefile from the bucket to the Earth Engine assets folder
-        cmd = ['earthengine', 'upload', 'table', f'--asset_id={config.gee_asset_id}', f'gs://{config.bucket_name}/{config.blob_name}.zip']
-
-        # Run the command
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            logging.info(f'Upload to Earth Engine assets folder started successfully: {result.stdout.strip()}')
-        except subprocess.CalledProcessError as e:
-            logging.error(f'Error uploading to Earth Engine assets folder: {e.stderr.strip()}')
-    
-    logging.info('Script executed successfully. Please check the Tasks section in the Google Earth Engine Code Editor for more details.')
+        msg += " Please check the 'Tasks' section in the Google Earth Engine Code Editor for more details."
+    logging.info(msg)
 
 
 if __name__ == "__main__":

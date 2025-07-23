@@ -300,6 +300,8 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
 
         # === 3. Post-processing of annotations: clean up existing values and fill in missing ones. ===
 
+    # TODO: set the grid_id for the interactive points
+
     # 1. Clean column types and formats
     columns_to_int = ['interpreter_confidence_level', 'reviewer_confidence_level']
     df[columns_to_int] = df[columns_to_int].astype('UInt8')  # No need for extra checks here, confidence levels in ESS are supposed to be restricted to values between 1 and 5.
@@ -391,6 +393,7 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
             dict_efgs.get(codes[2]) if codes else None
         ))
     )
+    #TODO: remove code at start of the string
 
     # Set the EFG codes for dominant and secondary values at 10m and 100m.
     cols_to_update = ['iucn_efg_code_dominant_10m', 'iucn_efg_code_secondary_10m', 'iucn_efg_code_dominant_100m', 'iucn_efg_code_secondary_100m']
@@ -404,11 +407,12 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
     gdf = df.rename(columns=annotation_fields)  # Rename GeoDataFrame columns with short names for safe export to shapefile
     gdf = gpd.GeoDataFrame(gdf, geometry=gpd.points_from_xy(df["longitude"], df["latitude"]), crs="EPSG:4326")
     gdf = gdf[[*gdf.columns[:3], "geometry", *gdf.columns[3:-1]]]  # Reorder columns (geometry to 4th position)
+    # TODO: 2 geo df, one with full labels for geojson and one with short labels for shp
 
     return raw_annotations_geojson, df, gdf
 
 
-def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob_name):
+def upload_to_bucket(source_file_name: str, destination_bucket_name: str, destination_blob_name: str) -> None:
     """Upload a file to the specified Cloud Storage bucket."""
 
     client = storage.Client()
@@ -421,6 +425,33 @@ def upload_to_bucket(source_file_name, destination_bucket_name, destination_blob
     blob.upload_from_filename(source_file_name)
 
     logging.info(f'Uploaded {source_file_name} to gs://{destination_bucket_name}/{destination_blob_name}.')
+
+
+def upload_to_asset(gc_project_id: str, source_gc_bucket_name: str, source_gc_blob_name: str, destination_gee_asset_id: str) -> None:
+    """ Transfer a file from a Cloud Storage bucket to the specified Cloud Earth Engine asset. """
+
+    # Initialise the Earth Engine project
+    ee.Authenticate()
+    ee.Initialize(project=gc_project_id)
+
+    # Delete the old Earth Engine asset if it exists
+    try:
+        info = ee.data.getInfo(destination_gee_asset_id)
+        if info:
+            ee.data.deleteAsset(destination_gee_asset_id)
+            logging.info(f'The asset {destination_gee_asset_id} already existed and has been overwritten.')
+    except Exception as e:
+        logging.error(f'Error checking asset: {e}')
+
+    # Build the Earth Engine CLI command to upload the zipped shapefile from the bucket to the Earth Engine assets folder
+    cmd = ['earthengine', 'upload', 'table', f'--asset_id={destination_gee_asset_id}', f'gs://{source_gc_bucket_name}/{source_gc_blob_name}.zip']
+
+    # Run the command
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        logging.info(f'Upload to Earth Engine assets folder started successfully: {result.stdout.strip()}')
+    except subprocess.CalledProcessError as e:
+        logging.error(f'Error uploading to Earth Engine assets folder: {e.stderr.strip()}')
 
 
 def main(config: Config, online_export: bool):
@@ -471,37 +502,13 @@ def main(config: Config, online_export: bool):
                     logging.warning(f"{file_path} not found, skipping.")
 
 
-            # 4. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets using environment variable settings. ===
+            # 4. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets. ===
 
         if online_export:
 
             gc_bucket_name, gc_blob_name, gee_asset_id = ess_project.get('gc_bucket_name'), ess_project.get('gc_blob_name'), ess_project.get('gee_asset_id')
-
-            # upload_to_GC_bucket
             upload_to_bucket(os.path.join(folder_path, f'{annotations_filename}.zip'), gc_bucket_name, f'{gc_blob_name}.zip')
-
-            # upload_to_EE_assets  # TODO: put EE export in a function
-            ee.Authenticate()
-            ee.Initialize(project=config.gc_project_id)
-
-            # Delete the old Earth Engine asset if it exists
-            try:
-                info = ee.data.getInfo(gee_asset_id)
-                if info:
-                    ee.data.deleteAsset(gee_asset_id)
-                    logging.info(f'The asset {gee_asset_id} already existed and has been overwritten.')
-            except Exception as e:
-                logging.error(f'Error checking asset: {e}')
-
-            # Build the Earth Engine CLI command to upload the zipped shapefile from the bucket to the Earth Engine assets folder
-            cmd = ['earthengine', 'upload', 'table', f'--asset_id={gee_asset_id}', f'gs://{gc_bucket_name}/{gc_blob_name}.zip']
-
-            # Run the command
-            try:
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                logging.info(f'Upload to Earth Engine assets folder started successfully: {result.stdout.strip()}')
-            except subprocess.CalledProcessError as e:
-                logging.error(f'Error uploading to Earth Engine assets folder: {e.stderr.strip()}')
+            upload_to_asset(config.gc_project_id, gc_bucket_name, gc_blob_name, gee_asset_id)
 
 
     msg = f"Script executed successfully with {i} project{'s' if i != 1 else ''} exported."

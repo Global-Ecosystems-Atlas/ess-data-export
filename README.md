@@ -38,12 +38,21 @@ If run with the `--online-export` flag, the annotations are also uploaded to Goo
     ```
 
 6. Create a `config.json` file in the project root directory based on the example file `config.example.json`.
-This file must follow the same structure as the example, with at least one required key: `ess_projects`, which contains a list of Earth System Studio projects.  
-Each project should include the following keys:
+This file must follow the same structure as the example and include at least two required keys:
+- `global_training_dataset`: Contains a dictionnary with the settings for the Global Training Dataset.
+- `ess_projects`: Contains a list of Earth System Studio projects from which to extract annotations.
+
+The `global_training_dataset` key should contain a dictionary with the following keys:
+- `file_name` (_required_): Name to assign to the Global Training Dataset file.
+- `gc_bucket_name` (_required for online export_): Google Cloud Storage bucket name. Will be concatenated with the blob name.
+- `gc_blob_name` (_required for online export_): Google Cloud Storage blob name. The last element is the filename and must match `file_name`. Do not include a file extension.
+- `gee_asset_id` (_required for online export_): Google Earth Engine asset ID where the Global Training Dataset will be saved. The last element is the filename and must match `file_name`. Do not include a file extension. The asset must exist before saving data to it.
+
+Each item in the `ess_projects` list should be a dictionary with the following keys:
 - `ess_project_id` (_required_): Earth System Studio project ID to extract annotations from.
 - `gc_bucket_name` (_required if online export_): Google Cloud Storage bucket name. Will be concatenated with the blob name.
-- `gc_blob_name` (_required if online export_): Google Cloud Storage blob name. The last element is the filename — do not include an extension.
-- `gee_asset_id` (_required if online export_): Google Earth Engine asset ID where the annotations will be saved. The last element is the filename — do not include an extension. The asset must exist before saving data to it.
+- `gc_blob_name` (_required if online export_): Google Cloud Storage blob name. The last element is the filename. Do not include a file extension.
+- `gee_asset_id` (_required if online export_): Google Earth Engine asset ID where the annotations will be saved. The last element is the filename. Do not include a file extension. The asset must exist before saving data to it.
 
 ## Usage
 

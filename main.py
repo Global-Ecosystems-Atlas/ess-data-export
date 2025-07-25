@@ -10,6 +10,7 @@ import requests
 import shutil
 import subprocess
 import sys
+import warnings
 import zipfile
 from datetime import datetime
 from dotenv import load_dotenv
@@ -74,6 +75,16 @@ class Config:
         if self.env not in ("dev", "prod"):
             raise ValueError("The 'env' key in the config file 'config.json' must be set to 'dev' or 'prod'.")
         
+        self.global_training_dataset = config_data.get("global_training_dataset")
+
+        if not isinstance(self.global_training_dataset, dict) or not self.global_training_dataset.get("file_name"):
+            raise ValueError("The config file 'config.json' must contain a 'global_training_dataset' key with a dictionary that includes a non-empty 'file_name' key.")
+        
+        if online_export:
+            missing_keys = [key for key in ("gc_bucket_name", "gc_blob_name", "gee_asset_id") if not self.global_training_dataset.get(key)]
+            if missing_keys:
+                raise ValueError(f"Missing required keys for online export of the global training dataset: {', '.join(missing_keys)}")
+
         self.ess_projects = config_data.get("ess_projects")
 
         if not isinstance(self.ess_projects, list) or not self.ess_projects:
@@ -181,7 +192,7 @@ def get_annotations_filename(ess_project_id: str) -> str:
     return f"annotations_{timestamp}_{ess_project_id}"
 
 
-def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd.DataFrame, gpd.GeoDataFrame]:
+def restructure_annotations(ess_project_id: str, interactive_sample_id_start: int, api: ESS_API) -> Tuple[dict, gpd.GeoDataFrame]:
 
         # === 1. Request and validate data. ===
 
@@ -196,43 +207,11 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
         raise ValueError(f"No users found for the project {ess_project_name} ({ess_project_id}).")
 
 
-        # === 2. Map the fields from the Global Ecosystems Atlas (GEA) specification to the Earth System Studio (ESS) annotation attributes and create a dictionary where each item represents an annotation with 32 fields. ===
+        # === 2. Map the fields from the Global Ecosystems Atlas (GEA) specification to the Earth System Studio (ESS) annotation attributes and create a GeoDataframe where each row represents an annotation with 32 fields. ===
 
     # List of the 32 fields associated with each annotation as defined in the document 'Global Ecosystems Atlas Training Dataset: Design and Specification'. Key = long name, value = short name (for shapefile).
-    annotation_fields  = {
-        "date": "date",
-        "sample_id": "sample_id",
-        "reference_grid_id": "grid_id",
-        "latitude": "latitude",
-        "longitude": "longitude",
-        "method": "method",
-        "interpretation_scale_min": "int_min",
-        "interpretation_scale_max": "int_max",
-        "iucn_realm": "iucn_realm",
-        "iucn_biome": "iucn_biome",
-        "iucn_ecosystem_functional_group": "iucn_efg",
-        "iucn_efg_code_dominant_10m": "efg_10m",
-        "iucn_efg_code_secondary_10m": "efg2_10m",
-        "iucn_efg_code_dominant_100m": "efg_100m",
-        "iucn_efg_code_secondary_100m": "efg2_100m",
-        "data_provider": "provider",  # Called "source" in the data specification, to be changed (in the data spec)
-        "data_producer": "producer",
-        "interpreter_name": "int_name",
-        "interpreter_confidence_level": "int_conf",
-        "reviewer_name": "rev_name",
-        "reviewer_confidence_level": "rev_conf",
-        "sample_type": "samp_type",
-        "valid_year_start": "year_start",
-        "valid_year_end": "year_end",
-        "homogeneity_estimate_dominant_10m": "hom_10m",
-        "homogeneity_estimate_secondary_10m": "hom2_10m",
-        "homogeneity_estimate_dominant_100m": "hom_100m",
-        "homogeneity_estimate_secondary_100m": "hom2_100m",
-        "interpreter_comment": "int_com",
-        "reviewer_comment": "rev_com",
-        "ess_task_id": "task_id",
-        "ess_annotation_id": "annot_id"
-    }
+    with open(os.path.join("resources", "gea_annotation_fields.json"), "r") as f:
+        annotation_fields = json.load(f)  # "source" in the data specification is "data_provider" here, to be changed in the data specification
 
     # In Earth System Studio, an annotation has both fixed, non-editable attributes and dynamic, user-defined attributes called metadata. Metadata are stored in the 'metadata_values' attribute of an annotation.
     # Since metadata fields in ESS are dynamic and user-defined for each project, different metadata names in different projects can refer to the same field in the GEA specification.
@@ -282,7 +261,8 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
                         return item.get("value")
         return None
 
-    # Build a dataframe of annotations where each row is an annotation with 32 fields (+ an additional DataFrame with extra information, not intended for export but useful for processing).
+    # Build a GeoDataFrame of annotations where each row is an annotation with 32 fields (and a geometry).
+    # Also build an additional DataFrame with extra information, not intended for export but useful for processing.
     annotations, annotations_extra = [], []
 
     for feature in raw_annotations_geojson["features"]:
@@ -295,33 +275,35 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
         annotation_extra = {'ess_annotation_id': feature["properties"].get("id"), 'ess_task_name': feature["properties"].get("task_name"), 'ess_task_status': feature["properties"].get("task_status")}
         annotations_extra.append(annotation_extra)
 
-    df, df_extra = pd.DataFrame(annotations), pd.DataFrame(annotations_extra)
+    gdf = gpd.GeoDataFrame(annotations, geometry=gpd.points_from_xy([a["longitude"] for a in annotations], [a["latitude"] for a in annotations]), crs="EPSG:4326")
+    gdf = gdf[[*gdf.columns[:3], "geometry", *gdf.columns[3:-1]]]  # Reorder columns to place geometry just before latitude and longitude
+    df_extra = pd.DataFrame(annotations_extra)
 
 
         # === 3. Post-processing of annotations: clean up existing values and fill in missing ones. ===
 
-    # TODO: set the grid_id for the interactive points
-
-    # 1. Clean column types and formats
+    # 3.1. Clean column types and formats
     columns_to_int = ['interpreter_confidence_level', 'reviewer_confidence_level']
-    df[columns_to_int] = df[columns_to_int].astype('UInt8')  # No need for extra checks here, confidence levels in ESS are supposed to be restricted to values between 1 and 5.
+    gdf[columns_to_int] = gdf[columns_to_int].astype('UInt8')  # No need for extra checks here, confidence levels in ESS are supposed to be restricted to values between 1 and 5.
     
     columns_to_float = ['homogeneity_estimate_dominant_10m', 'homogeneity_estimate_secondary_10m', 'homogeneity_estimate_dominant_100m', 'homogeneity_estimate_secondary_100m']
-    df[columns_to_float] = df[columns_to_float].astype("Float32")  # No need for extra checks here, homogeneity values in ESS are supposed to be restricted to between 0 and 100.
+    gdf[columns_to_float] = gdf[columns_to_float].astype("Float32")  # No need for extra checks here, homogeneity values in ESS are supposed to be restricted to between 0 and 100.
 
     columns_to_date = ["date", "valid_year_start", "valid_year_end"]
-    df[columns_to_date] = df[columns_to_date].apply(lambda col: pd.to_datetime(col, format='mixed', utc=True).dt.strftime("%d-%m-%Y"))
+    gdf[columns_to_date] = gdf[columns_to_date].apply(lambda col: pd.to_datetime(col, format='mixed', utc=True).dt.strftime("%d-%m-%Y"))
+
+    gdf["sample_id"] = pd.to_numeric(gdf["sample_id"], errors="coerce").astype("Int64")
 
 
-    # 2. Check for possible data entry errors where homogeneity estimates exceed 100% when adding dominant and secondary EFG.
-    sum_10m = df[['homogeneity_estimate_dominant_10m','homogeneity_estimate_secondary_10m']].sum(axis=1, skipna=True)
-    sum_100m = df[['homogeneity_estimate_dominant_100m','homogeneity_estimate_secondary_100m']].sum(axis=1, skipna=True)
+    # 3.2. Check for possible data entry errors where homogeneity estimates exceed 100% when adding dominant and secondary EFG.
+    sum_10m = gdf[['homogeneity_estimate_dominant_10m','homogeneity_estimate_secondary_10m']].sum(axis=1, skipna=True)
+    sum_100m = gdf[['homogeneity_estimate_dominant_100m','homogeneity_estimate_secondary_100m']].sum(axis=1, skipna=True)
     invalid_homogeneities = (sum_10m > 100) | (sum_100m > 100)
 
     if invalid_homogeneities.any():
         error_msg = []
-        for i in df[invalid_homogeneities].index:
-            ess_annotation_id = df.at[i, 'ess_annotation_id']
+        for i in gdf[invalid_homogeneities].index:
+            ess_annotation_id = gdf.at[i, 'ess_annotation_id']
             ess_task_name = df_extra.loc[df_extra['ess_annotation_id'] == ess_annotation_id, 'ess_task_name'].values[0]
             if sum_10m[i] > 100:
                 error_msg.append(f"{sum_10m[i]}% for homogeneity at 10m in annotation '{ess_annotation_id}' of task '{ess_task_name}'")
@@ -331,7 +313,7 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
         raise ValueError(f"In project {ess_project_name}, homogeneity values exceed 100% in the following annotations:\n" + "\n".join(error_msg))
 
 
-    # 3. Fill columns with constant values
+    # 3.3. Fill columns with constant values
     constant_values = {
         "method": "Image interpretation",  # May vary (e.g., field data), but if exported from ESS, it's almost certainly "Image interpretation".
         "interpretation_scale_min": 10,
@@ -341,22 +323,28 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
     }
 
     for field, value in constant_values.items():
-        df[field] = value
+        gdf[field] = value
 
 
-    # 4. Set sample type to "Interactive" for projects where the 'sample_type' metadata is present (do not fill anything for projects where the metadata is not present [Indo-Pacific Attols, Antarctic, Arctic]).
+    # 3.4. Set sample type to "Interactive" for projects where the 'sample_type' metadata is present (do not fill anything for projects where the metadata is not present [Indo-Pacific Attols, Antarctic, Arctic]).
     metadata_report = api.request_metadata_report(ess_project_id)
     if any(d['metadata_name'] == 'sample_type' for d in metadata_report):
-        df['sample_type'] = df['sample_type'].fillna("Interactive")
+        gdf['sample_type'] = gdf['sample_type'].fillna("Interactive")
 
 
-    # 5. Replace the interpreter and reviewer IDs with their names when possible
+    # 3.5. Fill in empty grid ID values (could be because the point was created interactively or due to missing 'reference_grid_id' metadata in the project [Indo-Pacific Atolls, Antarctic, Arctic]).
+    gdf_grid = gpd.read_file(os.path.join("resources", "EA_TrainingDataManagementGrid.gdb"), layer="ManagementGrid4TrainingData")
+    gdf_filled = gpd.sjoin(gdf[gdf["reference_grid_id"].isna()], gdf_grid[["Cell_ID", "geometry"]], how="left", predicate="within")
+    gdf.loc[gdf_filled.index, "reference_grid_id"] = gdf_filled["Cell_ID"].values
+
+
+    # 3.6. Replace the interpreter and reviewer IDs with their names when possible
     id_to_name = {user['id']: user['name'] for user in users}  # Build the mapping IDs → names
-    df['interpreter_name'] = df['interpreter_name'].map(id_to_name).fillna(df['interpreter_name'])
-    df['reviewer_name'] = df['reviewer_name'].map(id_to_name).fillna(df['reviewer_name'])
+    gdf['interpreter_name'] = gdf['interpreter_name'].map(id_to_name).fillna(gdf['interpreter_name'])
+    gdf['reviewer_name'] = gdf['reviewer_name'].map(id_to_name).fillna(gdf['reviewer_name'])
 
 
-    # 6. Set the EFG codes for dominant and secondary EFGs at 10m and 100m, and set the character strings for the dominant EFG at 100m.
+    # 3.7. Set the EFG codes for dominant and secondary EFGs at 10m and 100m, and set the character strings for the dominant EFG at 100m.
     def extract_IUCN_codes(input_str: str) -> Optional[Tuple[str, str, str]]:
         """Analyse a character string and identify whether an EFG code is present. If so, return a tuple of three values: the realm code, biome code, and EFG code. Otherwise, return None."""
         
@@ -379,6 +367,8 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
         if 'code' not in df.columns or 'name' not in df.columns:
             raise ValueError(f"Missing 'code' or 'name' columns in {excel_path}")
         
+        df['name'] = df['name'].str.split(' ', n=1).str[1]  # Remove the code at the beginning of the string.
+
         return dict(zip(df['code'], df['name']))
 
     dict_realms = load_IUCN_codes_dict(os.path.join("resources", "IUCN-GET-realms.xlsx"))  # Would be nice if this information could be retrieved from a GET site API
@@ -386,30 +376,29 @@ def restructure_annotations(ess_project_id: str, api: ESS_API) -> Tuple[dict, pd
     dict_efgs = load_IUCN_codes_dict(os.path.join("resources", "IUCN-GET-profiles-exported-2023-06-14.xlsx"), sheet_name="Short description")
 
     # Set the realm, biome, and EFG names for the dominant EFG at 100m.
-    df[['iucn_realm', 'iucn_biome', 'iucn_ecosystem_functional_group']] = df['iucn_efg_code_dominant_100m'].apply(  # TODO: Check that it's for the code at 100m and not 10m
+    gdf[['iucn_realm', 'iucn_biome', 'iucn_ecosystem_functional_group']] = gdf['iucn_efg_code_dominant_100m'].apply(  # TODO: Check that it's for the code at 100m and not 10m
         lambda v: pd.Series((
             dict_realms.get(codes[0]) if (codes := extract_IUCN_codes(v)) else None,
             dict_biomes.get(codes[1]) if codes else None,
             dict_efgs.get(codes[2]) if codes else None
         ))
     )
-    #TODO: remove code at start of the string
 
     # Set the EFG codes for dominant and secondary values at 10m and 100m.
     cols_to_update = ['iucn_efg_code_dominant_10m', 'iucn_efg_code_secondary_10m', 'iucn_efg_code_dominant_100m', 'iucn_efg_code_secondary_100m']
     for col in cols_to_update:
-        df[col] = df[col].apply(lambda v: codes[2] if (codes := extract_IUCN_codes(v)) else v)
+        gdf[col] = gdf[col].apply(lambda v: codes[2] if (codes := extract_IUCN_codes(v)) else v)
+
+
+    # 3.8. Set the sample IDs for the interactive points.
+    interactive_annotation_ids = gdf["sample_type"] == "Interactive"
+    gdf.loc[interactive_annotation_ids, "sample_id"] = range(interactive_sample_id_start + 1, interactive_sample_id_start + 1 + interactive_annotation_ids.sum())
+    gdf = gdf.sort_values("sample_id").reset_index(drop=True)
 
 
         # === 4. Return the values. ===
 
-    # Geospatial annotations DataFrame
-    gdf = df.rename(columns=annotation_fields)  # Rename GeoDataFrame columns with short names for safe export to shapefile
-    gdf = gpd.GeoDataFrame(gdf, geometry=gpd.points_from_xy(df["longitude"], df["latitude"]), crs="EPSG:4326")
-    gdf = gdf[[*gdf.columns[:3], "geometry", *gdf.columns[3:-1]]]  # Reorder columns (geometry to 4th position)
-    # TODO: 2 geo df, one with full labels for geojson and one with short labels for shp
-
-    return raw_annotations_geojson, df, gdf
+    return raw_annotations_geojson, gdf
 
 
 def upload_to_bucket(source_file_name: str, destination_bucket_name: str, destination_blob_name: str) -> None:
@@ -428,7 +417,7 @@ def upload_to_bucket(source_file_name: str, destination_bucket_name: str, destin
 
 
 def upload_to_asset(gc_project_id: str, source_gc_bucket_name: str, source_gc_blob_name: str, destination_gee_asset_id: str) -> None:
-    """ Transfer a file from a Cloud Storage bucket to the specified Cloud Earth Engine asset. """
+    """Transfer a file from a Cloud Storage bucket to the specified Cloud Earth Engine asset."""
 
     # Initialise the Earth Engine project
     ee.Authenticate()
@@ -454,28 +443,65 @@ def upload_to_asset(gc_project_id: str, source_gc_bucket_name: str, source_gc_bl
         logging.error(f'Error uploading to Earth Engine assets folder: {e.stderr.strip()}')
 
 
+def gdf_to_files(gdf, folder_path, annotations_filename) -> None:
+    """Export the given DataFrame as CSV, GeoJSON, and Shapefile using the specified name and output folder. Column names are shortened for the Shapefile export."""
+
+    # CSV
+    gdf.drop(columns="geometry").to_csv(os.path.join(folder_path, f"{annotations_filename}.csv"), index=False)
+    
+    # GeoJSON
+    gdf.to_file(os.path.join(folder_path, f"{annotations_filename}.geojson"), driver="GeoJSON")
+
+    # Zipped Shapefile
+    with open(os.path.join("resources", "gea_annotation_fields.json"), "r") as f:
+        annotation_fields = json.load(f)
+    
+    gdf_shp = gdf.rename(columns=annotation_fields)  # Rename GeoDataFrame columns with short names for safe export to shapefile.
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"Value '.*' of field .* has been truncated to 254 characters\.", category=RuntimeWarning, module="pyogrio.raw")  # Ignore this warning during shapefile export.
+        gdf_shp.to_file(os.path.join(folder_path, f"{annotations_filename}.shp"), driver="ESRI Shapefile")
+
+    with zipfile.ZipFile(os.path.join(folder_path, f"{annotations_filename}.zip"), "w") as zipf:
+        for ext in [".cpg", ".dbf", ".prj", ".shp", ".shx"]:  # List of shapefile extensions to include
+            file_path = os.path.join(folder_path, f"{annotations_filename}{ext}")
+            if os.path.exists(file_path):
+                zipf.write(file_path, arcname=f"{annotations_filename}{ext}")
+                os.remove(file_path)
+            else:
+                logging.warning(f"{file_path} not found, skipping.")
+
+
 def main(config: Config, online_export: bool):
 
-        # === 1. Set up and test the API connection, and reset the data folder. ===
+        # === 1. Setup and initialisation. ===
 
     api = ESS_API(config)
     api.test_connection()
+
     reset_data_folder()
 
+    gtd_gdfs = []  # Global Training Dataset
+    max_sample_id = int(pd.read_csv(os.path.join("resources", "gea_samples_v1_3_0.csv"))["sample_id"].max())
 
-    # Loop through all ESS projects specified in the configuration file 'config.json'.
+
+    # === 2. Loop through all ESS projects specified in the configuration file 'config.json'. ===
+
     for i, ess_project in enumerate(config.ess_projects, start=1):
 
 
-            # === 2. Retrieve and format the annotations. ===
+            # === 2.1. Retrieve and format the annotations. ===
 
         ess_project_id = ess_project.get('ess_project_id')
         ess_project_name = api.request_project_name(ess_project_id)
 
-        raw_annotations_geojson, df, gdf = restructure_annotations(ess_project_id, api)
+        raw_annotations_geojson, gdf = restructure_annotations(ess_project_id, max_sample_id, api)
+        gtd_gdfs.append(gdf)
 
+        max_sample_id += (gdf["sample_type"] == "Interactive").sum()
 
-            # === 3. Save the annotations locally in the 'exported_data' folder as CSV, zipped Shapefile, and GeoJSON formats. Also save the raw GeoJSON as received from the API. ===
+        
+            # === 2.2. Save the annotations locally in the 'exported_data' folder as CSV, zipped Shapefile, and GeoJSON formats. Also save the raw GeoJSON as received from the API. ===
 
         annotations_filename = get_annotations_filename(ess_project_id)
         folder_path = create_project_data_folder(ess_project_name)
@@ -484,31 +510,31 @@ def main(config: Config, online_export: bool):
         with open(os.path.join(folder_path, f"raw_{annotations_filename}.geojson"), "w", encoding="utf-8") as f:
             json.dump(raw_annotations_geojson, f, indent=2)
 
-        # CSV
-        df.to_csv(os.path.join(folder_path, f"{annotations_filename}.csv"), index=False)
-        
-        # GeoJSON
-        gdf.to_file(os.path.join(folder_path, f"{annotations_filename}.geojson"), driver="GeoJSON")
-
-        # Zipped Shapefile
-        gdf.to_file(os.path.join(folder_path, f"{annotations_filename}.shp"), driver="ESRI Shapefile")
-        with zipfile.ZipFile(os.path.join(folder_path, f"{annotations_filename}.zip"), "w") as zipf:
-            for ext in [".cpg", ".dbf", ".prj", ".shp", ".shx"]:  # List of shapefile extensions to include
-                file_path = os.path.join(folder_path, f"{annotations_filename}{ext}")
-                if os.path.exists(file_path):
-                    zipf.write(file_path, arcname=f"{annotations_filename}{ext}")
-                    os.remove(file_path)
-                else:
-                    logging.warning(f"{file_path} not found, skipping.")
+        gdf_to_files(gdf, folder_path, annotations_filename)
 
 
-            # 4. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets. ===
+            # 2.3. === (Optional) Upload the annotations to Google Cloud and Earth Engine Assets. ===
 
         if online_export:
-
             gc_bucket_name, gc_blob_name, gee_asset_id = ess_project.get('gc_bucket_name'), ess_project.get('gc_blob_name'), ess_project.get('gee_asset_id')
             upload_to_bucket(os.path.join(folder_path, f'{annotations_filename}.zip'), gc_bucket_name, f'{gc_blob_name}.zip')
             upload_to_asset(config.gc_project_id, gc_bucket_name, gc_blob_name, gee_asset_id)
+
+
+    # 3. === Create the Global Training Dataset. ===
+
+    gtd_gdf = gpd.GeoDataFrame(pd.concat(gtd_gdfs, ignore_index=True).sort_values("sample_id").reset_index(drop=True), crs="EPSG:4326")
+
+    gtd_file_name = config.global_training_dataset.get('file_name')
+    gdf_to_files(gtd_gdf, "exported_data", gtd_file_name)
+
+
+    # 3.2. === (Optional) Upload the Global Training Dataset to Google Cloud and Earth Engine Assets. ===
+
+    if online_export:
+        gtd_gc_bucket_name, gtd_gc_blob_name, gtd_gee_asset_id = config.global_training_dataset.get('gc_bucket_name'), config.global_training_dataset.get('gc_blob_name'), config.global_training_dataset.get('gee_asset_id')
+        upload_to_bucket(os.path.join("exported_data", f'{gtd_file_name}.zip'), gtd_gc_bucket_name, f'{gtd_gc_blob_name}.zip')
+        upload_to_asset(config.gc_project_id, gtd_gc_bucket_name, gtd_gc_blob_name, gtd_gee_asset_id)
 
 
     msg = f"Script executed successfully with {i} project{'s' if i != 1 else ''} exported."

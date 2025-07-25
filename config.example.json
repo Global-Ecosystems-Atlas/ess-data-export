@@ -1,6 +1,12 @@
 {
   "env": "[OPTIONAL] Defaults to 'prod'",
   "gc_project_id": "[OPTIONAL] Defaults to 'geo-global-ecosystems-atlas'",
+  "global_training_dataset": {
+    "file_name": "example-file-name  // [REQUIRED]",
+    "gc_bucket_name": "example-bucket-id  // [REQUIRED if online export]",
+    "gc_blob_name": "example/path/to/blob  // [REQUIRED if online export]",
+    "gee_asset_id": "example/path/to/asset  // [REQUIRED if online export]"
+  },
   "ess_projects": [
     {
       "ess_project_id": "example-project-1-id  // [REQUIRED]",
